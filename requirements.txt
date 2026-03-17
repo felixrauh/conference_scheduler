@@ -1,0 +1,11 @@
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+scipy>=1.10.0
+networkx>=3.0
+
+# Optional: Gurobi solver (required for traditional and matching pipelines)
+# Install separately: pip install gurobipy
+# Free academic license available at https://www.gurobi.com/academia/
+# The heuristic pipeline works without Gurobi.
+# gurobipy>=11.0.0

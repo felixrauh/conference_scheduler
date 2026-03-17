@@ -1,0 +1,200 @@
+{
+    // =========================================================================
+    // CONFERENCE SCHEDULING CONFIGURATION
+    // =========================================================================
+    // This is a JSONC file (JSON with Comments). 
+    //
+    // USAGE:
+    //   python scripts/run_schedule.py --config config/scheduling_config.jsonc
+    //   python scripts/run_schedule.py --config config/my_config.jsonc --pipeline matching
+    //
+    // CLI arguments override config file settings.
+    // =========================================================================
+    // -------------------------------------------------------------------------
+    // PIPELINE SELECTION
+    // -------------------------------------------------------------------------
+    // "traditional" - 3-phase optimization (Phase 1→2→3), requires Gurobi
+    // "heuristic"   - Greedy/scipy-based alternative (no Gurobi needed)
+    // "matching"    - Bottom-up matching pipeline (requires Gurobi)
+    "pipeline": "traditional",
+    // -------------------------------------------------------------------------
+    // INPUT DATA
+    // -------------------------------------------------------------------------
+    // Directory containing: talks.csv, preferences.csv, sessions.csv
+    // Optionally: availability.csv
+    // See examples/orbel2026/ for the expected format.
+    "input": {
+        "data_dir": "examples/orbel2026"
+    },
+    // -------------------------------------------------------------------------
+    // OUTPUT
+    // -------------------------------------------------------------------------
+    "output": {
+        "dir": "output",
+        "schedule_csv": "schedule_final.csv"
+    },
+    // -------------------------------------------------------------------------
+    // CONFERENCE STRUCTURE (Block Types)
+    // -------------------------------------------------------------------------
+    // Defines blocks: n rooms × k timeslots × count blocks.
+    //
+    // "auto" = read from sessions.csv (recommended).
+    // Override only if sessions.csv doesn't match your needs.
+    //
+    // Examples:
+    //   "block_types": {"5R4T": {"n": 5, "k": 4, "count": 3}}
+    //   "block_types": {
+    //       "5R4T": {"n": 5, "k": 4, "count": 2},
+    //       "4R4T": {"n": 4, "k": 4, "count": 2}
+    //   }
+    "block_types": "auto",
+    // -------------------------------------------------------------------------
+    // PHASE 1: TUPLE SELECTION
+    // -------------------------------------------------------------------------
+    // Group talks into parallel tuples, minimizing missed attendance.
+    "phase1": {
+        // Method:
+        // - "column_generation": Generates tuples on-demand (recommended, requires Gurobi)
+        // - "explicit": Enumerates all tuples with heuristic filtering (requires Gurobi)
+        // - "greedy": Fast heuristic (no Gurobi needed, used by heuristic pipeline)
+        "method": "column_generation",
+        // Solver time limit in seconds
+        "time_limit": 120.0,
+        // Explicit enumeration options (only used when method = "explicit")
+        "explicit": {
+            // Maximum cost threshold for tuple filtering.
+            // null = auto-calculate. Lower values (2-4) = aggressive filtering
+            // for large instances (100+ talks). Reduces memory at cost of quality.
+            "max_cost": null
+        },
+        // Column generation options (only used when method = "column_generation")
+        "column_generation": {
+            // Pricing strategy: "auto" | "enumeration" | "greedy" | "local_search" | "beam_search"
+            // "auto" selects based on problem size (recommended)
+            "pricing_strategy": "auto"
+        }
+    },
+    // -------------------------------------------------------------------------
+    // PHASE 2: BLOCK ASSEMBLY & ORDERING
+    // -------------------------------------------------------------------------
+    // Partition tuples into blocks and order talks to minimize room hopping.
+    "phase2": {
+        // Partition strategy: "matching" | "greedy" | "random"
+        // - matching: Best quality (paper's approach, uses assignment + perfect matching)
+        // - greedy: Fast, conflict-based assignment
+        // - random: Baseline for comparison
+        "partition_strategy": "matching",
+        // Ordering strategy: "enumerate" | "greedy"
+        // - enumerate: Tries all k! permutations (optimal for k ≤ 5)
+        // - greedy: Incremental (faster for k > 5)
+        "ordering_strategy": "enumerate",
+        // Local search iterations for post-optimization
+        "local_search_iterations": 2000,
+        // -------------------------------------------------------------------------
+        // FIXED SEQUENCES (Pre-specified sequential talks in one room)
+        // -------------------------------------------------------------------------
+        // Talks that run SEQUENTIALLY in ONE ROOM. They skip Phase 1 optimization
+        // and get attached as an extra room-column in Phase 2.
+        //
+        // Only used by "traditional" and "heuristic" pipelines.
+        //
+        // Each entry:
+        // - name: Descriptive name (e.g., "SpecialSession_1")
+        // - talks: Talk IDs in order (k talks for k timeslots)
+        // - target_block_type: Reduced block type for Phase 1 (1 fewer room)
+        // - result_block_type: Original block type (restored after attaching)
+        //
+        // Example:
+        // {"name": "SpecialSession_1", "talks": ["T039","T046","T051","T057"],
+        //  "target_block_type": "4R4T", "result_block_type": "5R4T"}
+        "fixed_sequences": []
+    },
+    // -------------------------------------------------------------------------
+    // PHASE 3: BLOCK SCHEDULING
+    // -------------------------------------------------------------------------
+    // Assign blocks to timeslots, respecting presenter availability.
+    "phase3": {
+        // Method: "milp" (Gurobi) | "hungarian" (scipy, no Gurobi needed)
+        "method": "milp",
+        // Solver time limit in seconds
+        "time_limit": 60.0
+    },
+    // -------------------------------------------------------------------------
+    // SWAP OPTIMIZATION (POST-PHASE 3, PRE-PHASE 4)
+    // -------------------------------------------------------------------------
+    // After blocks are assigned to timeslots, some presenter violations may
+    // remain. This phase swaps talks between positions to resolve them
+    // while minimizing impact on attendance and keyword coherence.
+    //
+    // Requires availability.csv in the data directory to have any effect.
+    "swap_optimization": {
+        "enabled": true,
+        // Weight for keyword coherence vs missed attendance (0.0-1.0)
+        // 0.0 = only minimize missed attendance
+        // 1.0 = equal weight to keyword coherence
+        "keyword_weight": 0.1,
+        // Maximum swap iterations
+        "max_iterations": 100,
+        // Also resolve dummy talk placement violations
+        // (dummy in short block, or 2+ dummies in same room-session)
+        "check_dummy_violations": true,
+        // Blocks with k ≤ this threshold are "short" — dummies there are violations
+        "short_block_threshold": 3
+    },
+    // -------------------------------------------------------------------------
+    // PHASE 4: FINALIZATION & ROOM ASSIGNMENT
+    // -------------------------------------------------------------------------
+    // Computes session metrics, assigns rooms by audience size, and adds
+    // any fixed block sessions.
+    //
+    // Room assignment: smallest audience → smallest room (greedy, optimal).
+    "phase4": {
+        // -------------------------------------------------------------------------
+        // FIXED BLOCK SESSIONS (Pre-specified sessions for specific blocks)
+        // -------------------------------------------------------------------------
+        // Talks that are pre-assigned to both a session grouping AND a specific
+        // block/timeslot. These are excluded from Phases 1-3 entirely.
+        //
+        // Different from fixed_sequences (above): fixed_sequences let the
+        // optimizer choose which timeslot; fixed_block_sessions lock in both
+        // the grouping and the timeslot.
+        //
+        // Each entry:
+        // - name: Descriptive name
+        // - block: Target block ID from sessions.csv (e.g., "FA", "FB")
+        // - talks: Talk IDs in sequence order
+        //
+        // Example:
+        // "fixed_block_sessions": [
+        //     {"name": "SpecialSession_1", "block": "FA", "talks": ["T039","T046","T051","T057"]},
+        //     {"name": "SpecialSession_2", "block": "FB", "talks": ["T058","T072","T122","T124"]}
+        // ]
+        "fixed_block_sessions": []
+    },
+    // -------------------------------------------------------------------------
+    // MATCHING PIPELINE SETTINGS
+    // -------------------------------------------------------------------------
+    // Only used when pipeline = "matching".
+    // Bottom-up approach: pair talks → form blocks → select tuples → order.
+    // See docs/matching_pipeline_specification.md for details.
+    "matching_pipeline": {
+        // Total time limit across all phases (distributed automatically:
+        // 15% pairing, 15% block formation, 40% tuple selection, 30% ordering)
+        "time_limit": 300.0
+    },
+    // -------------------------------------------------------------------------
+    // ROOMS
+    // -------------------------------------------------------------------------
+    // Physical rooms with capacities. Used in Phase 4 for room assignment
+    // (smallest audience → smallest room).
+    // Room names and capacities are optional. If omitted, rooms are numbered
+    // automatically. When provided, rooms are assigned by audience size
+    // (smallest audience → smallest room).
+    "rooms": [
+        {"id": "A", "name": "Room A", "capacity": 250},
+        {"id": "B", "name": "Room B", "capacity": 120},
+        {"id": "C", "name": "Room C", "capacity": 80},
+        {"id": "D", "name": "Room D", "capacity": 60},
+        {"id": "E", "name": "Room E", "capacity": 40}
+    ]
+}

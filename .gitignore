@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Gurobi
+*.lp
+*.mps
+*.sol
+*.log
+
+# Project specific
+output/
+
+# CSV files (except examples)
+*.csv
+!examples/**/*.csv
+
+# Excel files with potentially sensitive data
+preference_analysis.xlsx
+List of talks*.xlsx
+
+# Sensitive data directories (original, non-anonymized data)
+data/input/data*/
+Submissions*/
+
+scripts/keywords/
+
+# Development/debugging test scripts (not part of test suite)
+test_*.py
+!tests/test_*.py
+
+# SLURM outputs
+slurm/
+*.slurm.out

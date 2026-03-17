@@ -1,0 +1,14 @@
+# Project metadata (for reference only - install via: pip install -r requirements.txt)
+
+[project]
+name = "conference-scheduler"
+version = "0.1.0"
+description = "Conference scheduling optimization based on Vangerven et al. (2018) and extensions by Felix Rauh"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
