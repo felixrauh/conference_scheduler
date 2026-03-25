@@ -11,6 +11,8 @@ Nonetheless, manual review and post-processing are expected and encouraged. Conf
 
 **Stay updated.** Pull the latest version regularly for improvements and bug fixes. We may also upload reports documenting experiences and insights from real-world applications.
 
+**Update:** Added modified slides from conference talk about the scheduling process with some visualizations and takeaways.
+
 ## Installation
 
 ```bash

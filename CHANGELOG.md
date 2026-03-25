@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Modified slides from conference talk about the scheduling process with some visualizations and takeaways
 - `scripts/batch_evaluate.py` — batch evaluation script for comparing schedules with consistent evaluator metrics
 - Column name normalization in `load_schedule_csv()` so the `ScheduleEvaluator` works with Phase 4 CSV exports (`Block_ID`/`Room_ID` → `Session_ID`/`Room`)
 - `--phase2-partition` CLI argument for `run_schedule.py` — choose `greedy`, `matching`, or `random` partition strategy directly from the command line
