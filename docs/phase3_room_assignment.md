@@ -8,9 +8,9 @@ Phase 3 does two things:
 1. **Assign blocks to timeslots** (satisfying presenter availability)
 2. **Assign room positions to physical rooms** (maximize capacity gap)
 
----
+Phase 3 is shared by all pipelines (`src/phase3.py`; method `milp` or `hungarian`, see `phase3.method`).
 
-Room capacities are configured via the `rooms` section in the config file or inferred from input data. Phase 4 assigns rooms using a greedy algorithm (smallest audience to smallest room).
+> **Note:** The room assignment of step 2 is provisional. When `run_schedule.py` finishes, Phase 4 assigns the physical rooms again, after swap optimization and with any fixed block sessions included: sessions sorted by *total likes* (sum of preferences for their talks) are matched to rooms sorted by capacity (`assign_rooms_by_audience` in `src/phase4.py`). Room capacities come from the `rooms` section of the config file; without it, all rooms get the same capacity.
 
 ---
 
@@ -72,7 +72,7 @@ For each block independently:
 3. Sort physical rooms by capacity (descending)
 4. Match: highest interest → largest room
 
-This is **optimal** for maximizing minimum capacity gap within each block.
+This is **optimal** for maximizing the minimum capacity gap within each block.
 
 ### Example
 
@@ -94,7 +94,7 @@ Assignment:
 - Position 2 (28) → Room C (80): gap = 52
 - Position 3 (22) → Room D (60): gap = 38
 
-Minimum gap = 44 ✓
+Minimum gap = 38 (Position 3 → Room D)
 
 ---
 
@@ -102,7 +102,8 @@ Minimum gap = 44 ✓
 
 ### Sets
 - $B$: Set of blocks (from Phase 2)
-- $S$: Set of timeslots (compatible with block types)
+- $S$: Set of timeslots (one per row of `sessions.csv`)
+- $S_b \subseteq S$: Timeslots compatible with block $b$, i.e. with the same type (rooms × talks per room) as the block
 
 ### Parameters
 - $u_{b,s}$: Number of presenter availability violations if block $b$ is assigned to timeslot $s$
@@ -112,11 +113,13 @@ Minimum gap = 44 ✓
 
 ### Formulation
 
-$$\min \sum_{b \in B} \sum_{s \in S} u_{b,s} \cdot y_{b,s}$$
+$$\min \sum_{b \in B} \sum_{s \in S_b} u_{b,s} \cdot y_{b,s}$$
 
 Subject to:
-$$\sum_{s \in S} y_{b,s} = 1 \quad \forall b \in B \quad \text{(each block to one timeslot)}$$
-$$\sum_{b \in B} y_{b,s} \leq 1 \quad \forall s \in S \quad \text{(each timeslot at most one block)}$$
+$$\sum_{s \in S_b} y_{b,s} = 1 \quad \forall b \in B \quad \text{(each block to one compatible timeslot)}$$
+$$\sum_{b \in B: s \in S_b} y_{b,s} \leq 1 \quad \forall s \in S \quad \text{(each timeslot at most one block)}$$
+
+This is a bipartite assignment problem. `milp` solves it with Gurobi; `hungarian` solves the same problem with scipy's `linear_sum_assignment` (incompatible pairs get a prohibitive cost). Both return an optimal assignment. Violations that remain are reported and handed to swap optimization.
 
 ---
 
@@ -161,4 +164,4 @@ def compute_violation_cost(block, timeslot, talk_presenter, presenter_unavailabi
 
 ### Room Configuration
 
-Room capacities and names are defined in the config file (`rooms` section) or via the `ConferenceData` object. See [configuration_and_algorithm_reference.md](configuration_and_algorithm_reference.md#phase-4-finalization--room-assignment) for configuration details.
+Room capacities and names are defined in the config file (`rooms` section) or via the `ConferenceData` object. See [configuration_and_algorithm_reference.md](configuration_and_algorithm_reference.md#phase-4-finalization--room-assignment-shared-across-all-pipelines) for configuration details.

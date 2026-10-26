@@ -105,7 +105,8 @@ def compute_infeasible_talk_pairs(
 
     A pair (t1, t2) is considered infeasible if:
     - Their presenters' combined unavailabilities cover at least
-      `min_unavailable_threshold` timeslots (default: 5 of 7)
+      `min_unavailable_threshold` timeslots (default: 5 of 7), or all
+      timeslots if there are fewer than that
 
     This is stricter than requiring ALL timeslots to be blocked, because
     pairs with very few available slots create scheduling bottlenecks in
@@ -127,6 +128,8 @@ def compute_infeasible_talk_pairs(
         return set()
 
     total_timeslots = len(all_timeslots)
+    # With fewer timeslots than the threshold, only fully blocked pairs count
+    min_unavailable_threshold = min(min_unavailable_threshold, total_timeslots)
     infeasible_pairs: Set[Tuple[str, str]] = set()
     talks = instance.talks
 

@@ -20,9 +20,22 @@ The room assignment algorithm is greedy and provably optimal:
 
 from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import dataclass, field
+import re
 import pandas as pd
 
 from .phase3 import Phase3Result, RoomAssignment
+from .utils import is_placeholder
+
+
+def _natural_key(s: str):
+    """Sort key so that 'Room_2' comes before 'Room_10'."""
+    return [int(part) if part.isdigit() else part
+            for part in re.split(r'(\d+)', str(s))]
+
+
+def _in_order_of_appearance(values) -> List[str]:
+    """Unique values in first-appearance order (blocks are stored chronologically)."""
+    return list(dict.fromkeys(values))
 
 
 # =============================================================================
@@ -101,7 +114,7 @@ class ScheduleResult:
         for m in self.session_metrics:
             metrics_by_block[m.block_id].append(m)
 
-        for block_id in sorted(by_block.keys()):
+        for block_id in _in_order_of_appearance(s.block_id for s in self.sessions):
             block_sessions = by_block[block_id]
             lines.append(f"\n## Block {block_id}\n")
 
@@ -111,7 +124,7 @@ class ScheduleResult:
                 by_room[s.room_id].append(s)
 
             # Table header
-            rooms = sorted(by_room.keys())
+            rooms = sorted(by_room.keys(), key=_natural_key)
             max_slots = max(len(talks) for talks in by_room.values())
 
             # Build a table: rows = slots, columns = rooms
@@ -123,7 +136,9 @@ class ScheduleResult:
                 for room in rooms:
                     room_talks = sorted(by_room[room], key=lambda s: s.slot)
                     talk = next((t for t in room_talks if t.slot == slot), None)
-                    if talk:
+                    if talk and is_placeholder(talk.talk_id):
+                        cell = " *(empty)* "
+                    elif talk:
                         cell = f" {talk.title} ({talk.primary_contact_author}) "
                         if talk.is_fixed:
                             cell += "[fixed] "
@@ -134,7 +149,7 @@ class ScheduleResult:
 
             # Room metrics summary
             block_metrics = sorted(
-                metrics_by_block.get(block_id, []), key=lambda m: m.room_id)
+                metrics_by_block.get(block_id, []), key=lambda m: _natural_key(m.room_id))
             if block_metrics:
                 lines.append("")
                 for m in block_metrics:
@@ -172,7 +187,7 @@ class ScheduleResult:
 
         Shows which preferred talks they can attend per block,
         flags conflicts (multiple preferred talks in parallel),
-        and tracks room switches.
+        and tracks room switches within each block.
 
         Args:
             participant_id: The participant to generate for
@@ -194,13 +209,14 @@ class ScheduleResult:
         for s in self.sessions:
             by_block[s.block_id].append(s)
 
-        prev_room = None
         total_conflicts = 0
         total_hops = 0
         blocks_attended = 0
 
-        for block_id in sorted(by_block.keys()):
+        for block_id in _in_order_of_appearance(s.block_id for s in self.sessions):
             block_sessions = by_block[block_id]
+            # Changing rooms between blocks is free; only count switches within a block
+            prev_room = None
 
             # Find preferred talks in this block, grouped by slot
             by_slot: Dict[int, List[FinalSession]] = defaultdict(list)
@@ -216,7 +232,10 @@ class ScheduleResult:
 
             for slot in sorted(by_slot.keys()):
                 slot_talks = by_slot[slot]
-                chosen = slot_talks[0]
+                # Among parallel preferred talks, stay in the current room if possible
+                chosen = next((t for t in slot_talks if t.room_id == prev_room),
+                              slot_talks[0])
+                slot_talks = [chosen] + [t for t in slot_talks if t is not chosen]
 
                 if len(slot_talks) > 1:
                     # Conflict: multiple preferred talks in parallel
@@ -404,6 +423,11 @@ def assign_rooms_by_audience(
     # Filter out unavailable rooms, then sort by capacity (ascending)
     available_rooms = {
         r: c for r, c in room_capacities.items() if r not in unavailable_rooms}
+    if len(available_rooms) < n_sessions:
+        raise ValueError(
+            f"{n_sessions} parallel sessions need a room each, but only "
+            f"{len(available_rooms)} rooms are available. Add rooms to the "
+            f"'rooms' list in the config file.")
     sorted_rooms = sorted(available_rooms.items(),
                           key=lambda x: x[1])[:n_sessions]
 
@@ -462,7 +486,8 @@ def validate_fixed_block_sessions(
 def solve_phase4(
     phase4_input: Phase4Input,
     room_names: Optional[Dict[str, str]] = None,
-    verbose: bool = True
+    verbose: bool = True,
+    timeslot_order: Optional[List[str]] = None
 ) -> ScheduleResult:
     """
     Solve Phase 4: Finalization and room assignment.
@@ -477,6 +502,8 @@ def solve_phase4(
         phase4_input: Phase4Input with all required data
         room_names: Optional mapping room_id -> display name
         verbose: Print progress
+        timeslot_order: Optional chronological list of timeslot IDs; the
+            output is ordered accordingly (default: Phase 3 order)
 
     Returns:
         ScheduleResult with finalized schedule
@@ -545,8 +572,18 @@ def solve_phase4(
             print(
                 f"  Adding {len(fixed_block_sessions)} fixed block sessions to timeslots: {list(fixed_by_timeslot.keys())}...")
 
+    assignments = list(phase3_result.assignments)
+    if timeslot_order:
+        position = {ts_id: i for i, ts_id in enumerate(timeslot_order)}
+
+        def _ts_position(assignment):
+            ts = assignment.timeslot
+            ts_id = ts.get('id', ts) if isinstance(ts, dict) else str(ts)
+            return position.get(ts_id, len(position))
+        assignments.sort(key=_ts_position)
+
     # Process each block
-    for assignment in phase3_result.assignments:
+    for assignment in assignments:
         block = assignment.block
         timeslot = assignment.timeslot
         # Use timeslot ID as the session key (TA, FB, etc.)
@@ -720,7 +757,18 @@ def phase4_result_to_dataframe(result: ScheduleResult) -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows)
-    df = df.sort_values(['Block_ID', 'Room_ID', 'Slot'])
-    return df
+    if df.empty:
+        return df
+    # Integer IDs (placeholders have none) instead of floats like 42.0
+    df['Paper_ID'] = pd.to_numeric(df['Paper_ID'], errors='coerce').astype('Int64')
+    # Keep blocks in chronological (first-appearance) order, rooms in natural order
+    block_position = {b: i for i, b in enumerate(
+        _in_order_of_appearance(df['Block_ID']))}
+    room_position = {r: i for i, r in enumerate(
+        sorted(df['Room_ID'].unique(), key=_natural_key))}
+    df = df.assign(_b=df['Block_ID'].map(block_position),
+                   _r=df['Room_ID'].map(room_position))
+    df = df.sort_values(['_b', '_r', 'Slot'], kind='stable')
+    return df.drop(columns=['_b', '_r']).reset_index(drop=True)
 
 

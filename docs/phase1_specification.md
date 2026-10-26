@@ -88,40 +88,43 @@ $$x_e \in \{0, 1\} \quad \forall e \in H$$
 For the model to be feasible, the total number of slots must equal the number of talks:
 $$|X| = \sum_{\tau \in \mathcal{T}} n_\tau \cdot p_\tau = \sum_{\beta \in \mathcal{B}} n_\beta \cdot k_\beta \cdot r_\beta$$
 
+If `sessions.csv` provides more slots than there are talks, the pipelines add placeholder talks (`PLACEHOLDER_<n>`, no preferences, so cost 0) to $X$ until equality holds. More talks than slots is rejected before optimization.
+
 ---
 
 ## Data Types
 
 ### Input Data Structures
 
+Defined in `src/data_loader.py` (abbreviated):
+
 ```python
 @dataclass
 class ConferenceData:
     """Container for all conference input data."""
-    
+
     conference_name: str
-    rooms: List[str]
-    
-    # Block types: {type_id: {"n": int, "k": int, "count": int}}
+    rooms: List[str]              # Room_1 ... Room_<max rooms>
+
+    # Block types, merged by shape: {"5R4T": {"n": 5, "k": 4, "count": 4}, ...}
     block_types: Dict[str, Dict]
-    
-    # Timeslots: list of {"id", "start_time", "type_id", "rooms"}
+
+    # One timeslot per row of sessions.csv: {"id": "TA", "type_id": "5R4T", "rooms": [...]}
     timeslots: List[Dict]
-    
-    # Talks: DataFrame [talk_id, title, presenter_id, track]
+
+    # Talks: DataFrame [talk_id, presenter_id, title, keywords, ...]
     talks: pd.DataFrame
-    
-    # Participants: DataFrame [participant_id, name, email]
-    participants: pd.DataFrame
-    
-    # Preferences: DataFrame [participant_id, talk_id]
+
+    # Preferences: DataFrame [participant_id, talk_id] (participants are derived from it)
     preferences: pd.DataFrame
-    
+
     # Availability: DataFrame [presenter_id, unavailable_timeslot]
     availability: pd.DataFrame
-    
-    # Derived: {participant_id: set of preferred talk_ids}
+
+    # Derived by validate(): {participant_id: set of preferred talk_ids}
     preference_matrix: Dict[str, Set[str]]
+    # Derived by validate(): {presenter_id: set of unavailable timeslot_ids}
+    presenter_unavailability: Dict[str, Set[str]]
 ```
 
 ### Problem Instance
@@ -153,11 +156,11 @@ class ProblemInstance:
 ### Phase 1 Output
 
 ```python
-# For fixed-n approach: List of selected n-tuples
+# List of selected tuples (of varying sizes)
 Phase1Result = List[Tuple[str, ...]]
 
-# For variable-n approach: Mapping from block type to n-tuples
-Phase1ResultByType = Dict[str, List[Tuple[str, ...]]]
+# The same tuples grouped by tuple size n (input format of Phase 2)
+Phase1ResultByType = Dict[int, List[Tuple[str, ...]]]
 ```
 
 ### N-Tuple Representation
@@ -183,29 +186,18 @@ def compute_tuple_cost(ntuple: NTuple, preferences: Dict[str, Set[str]]) -> int:
 
 ## Filtering Infeasible Tuples
 
-To reduce the size of $H$, filter out n-tuples that violate hard constraints:
+To reduce the size of $H$, the explicit method (`solve_phase1_explicit` in `src/phase1.py`) only generates tuples that pass these filters:
 
-### Filter Functions
+1. **Same presenter** — no two talks by the same presenter in one tuple (`ProblemInstance.talks_have_same_presenter`).
+2. **Presenter availability** — no pair of talks whose presenters' combined unavailabilities block too many timeslots (`compute_infeasible_talk_pairs` in `src/instance.py`; see [developer_notes.md](developer_notes.md#infeasible-talk-pairs)).
+3. **Heuristic filters** — only when more than ~1M tuples would be generated:
+   - tuples containing a *popular pair* (two talks many participants want to see together) are dropped;
+   - tuples containing two or more preferred talks are kept only if their cost is at most `max_cost` (config `phase1.explicit.max_cost`; `null` = derived from a sample of the cost distribution);
+   - talks left with fewer than 50 candidate tuples get the cheapest rejected tuples back.
 
-```python
-def filter_same_presenter(ntuple: NTuple, talk_presenter: Dict[str, str]) -> bool:
-    """Reject if any two talks have the same presenter."""
-    presenters = [talk_presenter[t] for t in ntuple]
-    return len(presenters) == len(set(presenters))
+   These filters can exclude the optimal solution, so the result is then no longer provably optimal.
 
-def filter_track_constraints(ntuple: NTuple, talks_df: pd.DataFrame, max_per_track: int) -> bool:
-    """Reject if too many talks from same track in parallel."""
-    tracks = [talks_df.loc[talks_df['talk_id'] == t, 'track'].iloc[0] for t in ntuple]
-    from collections import Counter
-    return all(count <= max_per_track for count in Counter(tracks).values())
-
-def filter_must_not_overlap(ntuple: NTuple, forbidden_pairs: Set[FrozenSet[str]]) -> bool:
-    """Reject if any forbidden pair of talks are both in tuple."""
-    for t1, t2 in combinations(ntuple, 2):
-        if frozenset({t1, t2}) in forbidden_pairs:
-            return False
-    return True
-```
+The column generation method (default) does not enumerate $H$; see [column_generation.md](column_generation.md).
 
 ---
 
@@ -217,21 +209,19 @@ from src.instance import build_instance
 from src.phase1 import solve_phase1
 
 # Load data
-data = load_from_csv_dir("examples/orbel2026")
+data = load_from_csv_dir("examples/synthetic")
 data.validate()
 instance = build_instance(data)
 
-# Solve the unified model
-selected_tuples = solve_phase1(
-    instance=instance,
-    time_limit=300.0,
-    verbose=True
-)
+# Solve the unified model (explicit enumeration by default)
+selected_tuples = solve_phase1(instance, time_limit=60.0, verbose=False)
 
 # Result: tuples of varying sizes
 for t in selected_tuples:
     print(f"Parallel ({len(t)} rooms): {t}")
 ```
+
+For larger instances (50+ talks) use `method="column_generation"`; explicit enumeration of e.g. the 118-talk ORBEL 2026 data would need about 182M variables.
 
 ---
 

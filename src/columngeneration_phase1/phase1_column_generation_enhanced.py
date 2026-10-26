@@ -11,7 +11,7 @@ This module provides improved pricing problem solvers with multiple strategies:
 import gurobipy as gp
 from gurobipy import GRB
 from itertools import combinations
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set
 import random
 import heapq
 
@@ -279,7 +279,8 @@ class Phase1ColumnGenerationEnhanced:
 
     def __init__(self, env: gp.Env, talks: List[str], participants: List[str],
                  preferences: Dict[str, Set[str]], tuple_types: List[Tuple[int, int]],
-                 pricing_strategy: str = 'auto', verbose: bool = True):
+                 pricing_strategy: str = 'auto', verbose: bool = True,
+                 initial_columns: Optional[List[Tuple[str, ...]]] = None):
         """
         Initialize enhanced column generation solver.
 
@@ -291,6 +292,9 @@ class Phase1ColumnGenerationEnhanced:
             tuple_types: List of (n_tau, p_tau) tuples
             pricing_strategy: 'auto', 'enumeration', 'greedy', 'local_search', 'beam_search'
             verbose: Print detailed progress information
+            initial_columns: Optional tuples to add to the column pool, e.g. a
+                heuristic solution. If they form a complete solution, the final
+                MIP starts from it, so the result is never worse.
         """
         self.env = env
         self.talks = talks
@@ -298,6 +302,18 @@ class Phase1ColumnGenerationEnhanced:
         self.preferences = preferences
         self.tuple_types = tuple_types
         self.pricing_strategy = pricing_strategy
+
+        # Seed columns, stored in the same talk order as generated columns
+        talk_index = {t: i for i, t in enumerate(talks)}
+        sizes = {n_tau for n_tau, _ in tuple_types}
+        self.initial_columns = []
+        for col in initial_columns or []:
+            unknown = [t for t in col if t not in talk_index]
+            if unknown or len(col) not in sizes:
+                raise ValueError(
+                    f"Invalid initial column {col}: unknown talks {unknown} "
+                    f"or size {len(col)} not in {sorted(sizes)}")
+            self.initial_columns.append(tuple(sorted(col, key=talk_index.get)))
         self.verbose = verbose
 
         # Validate feasibility
@@ -365,8 +381,10 @@ class Phase1ColumnGenerationEnhanced:
             print(
                 f"\nInitialization: {len(self.columns)} columns in {self.stats['initialization_time']:.2f}s\n")
 
-        # Column generation loop
+        # Column generation loop (may run zero times if initialization used
+        # up the time limit; the final MIP then uses the initial columns)
         iteration = 0
+        new_columns = None
         while iteration < max_iterations and time.time() - start_time < time_limit:
             iteration += 1
             self.iteration_count = iteration
@@ -404,7 +422,7 @@ class Phase1ColumnGenerationEnhanced:
                 print(
                     f"  Added {len(new_columns)} columns (Total: {len(self.columns)})\n")
 
-        converged = not new_columns if iteration <= max_iterations else False
+        converged = iteration > 0 and not new_columns
         stopped_reason = None
         if not converged:
             if time.time() - start_time >= time_limit:
@@ -487,7 +505,17 @@ class Phase1ColumnGenerationEnhanced:
         }
 
     def _initialize_columns(self):
-        """Initialize with greedy heuristic."""
+        """
+        Initialize with greedy heuristic.
+
+        For each required tuple, take the cheapest of up to 500 candidate
+        tuples from the remaining talks. Candidates are sampled directly:
+        listing all combinations first would need e.g. 225M tuples (many GB
+        and minutes) for 123 talks and 5 rooms.
+        """
+        from math import comb
+
+        talk_index = {t: i for i, t in enumerate(self.talks)}
         remaining = set(self.talks)
 
         for n_tau, p_tau in self.tuple_types:
@@ -499,11 +527,15 @@ class Phase1ColumnGenerationEnhanced:
                 best_cost = float('inf')
                 best_tuple = None
 
-                # Sample candidates
-                candidates = list(combinations(remaining, n_tau))
-                if len(candidates) > 500:
-                    import random
-                    candidates = random.sample(candidates, 500)
+                # Candidates in self.talks order, like the pricing problems
+                pool = sorted(remaining, key=talk_index.get)
+                if comb(len(pool), n_tau) <= 500:
+                    candidates = list(combinations(pool, n_tau))
+                else:
+                    candidates = {
+                        tuple(sorted(random.sample(pool, n_tau), key=talk_index.get))
+                        for _ in range(500)
+                    }
 
                 for cand in candidates:
                     cost = compute_tuple_cost(cand, self.preferences)
@@ -514,6 +546,9 @@ class Phase1ColumnGenerationEnhanced:
                 self._add_column(best_tuple)
                 for talk in best_tuple:
                     remaining.discard(talk)
+
+        for col in self.initial_columns:
+            self._add_column(col)
 
     def _add_column(self, ntuple: Tuple[str, ...]):
         """Add column to master."""
@@ -630,6 +665,10 @@ class Phase1ColumnGenerationEnhanced:
 
         for var in self.x_vars.values():
             var.vtype = GRB.BINARY
+
+        # Start from the seed solution (Gurobi ignores it if it is incomplete)
+        for col in self.initial_columns:
+            self.x_vars[col].Start = 1
 
         self.master_model.update()
         self.master_model.setParam('OutputFlag', 1 if self.verbose else 0)

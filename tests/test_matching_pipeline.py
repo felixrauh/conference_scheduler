@@ -6,6 +6,15 @@ Creates a small problem instance and runs the matching pipeline
 to verify all phases work correctly.
 """
 
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+pytest.importorskip("gurobipy")
+
 from src.matching_pipeline import (
     run_matching_pipeline,
     solve_phase_a,
@@ -17,8 +26,6 @@ from src.matching_pipeline import (
 from src.instance import build_instance
 from src.data_loader import ConferenceData
 import pandas as pd
-import sys
-sys.path.insert(0, '.')
 
 
 def create_test_instance(n_talks=24, n_rooms=4, k=3, n_blocks=2):
@@ -149,7 +156,6 @@ def test_phase_a():
 
     print(
         f"✓ Phase A passed: {len(pairs)} pairs, {len(singles)} singles, weight={weight}")
-    return True
 
 
 def test_phase_b():
@@ -184,7 +190,6 @@ def test_phase_b():
 
     print(
         f"✓ Phase B passed: {len(blocks_3)} 3-blocks, {len(blocks_4)} 4-blocks, marginal={weight}")
-    return True
 
 
 def test_full_pipeline():
@@ -221,7 +226,6 @@ def test_full_pipeline():
         f"  - Blocks: {len(result.ordered_blocks)}, benefit={result.phase_d_benefit}")
     print(f"  - Total time: {result.total_time:.2f}s")
 
-    return True
 
 
 def test_tuple_cost():
@@ -250,7 +254,6 @@ def test_tuple_cost():
 
     assert cost == expected, f"Expected cost {expected}, got {cost}"
     print(f"✓ Tuple cost test passed: cost={cost}")
-    return True
 
 
 def create_test_instance_variable_n(n_talks, block_types_config):
@@ -396,33 +399,7 @@ def test_variable_n_pipeline():
 
     print(f"✓ Variable N pipeline test passed!")
     print(f"  Total cost: {result.phase_c_cost}")
-    return True
 
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("MATCHING PIPELINE TESTS")
-    print("=" * 70)
-
-    all_passed = True
-
-    try:
-        all_passed &= test_tuple_cost()
-        all_passed &= test_phase_a()
-        all_passed &= test_phase_b()
-        all_passed &= test_full_pipeline()
-        all_passed &= test_variable_n_pipeline()
-    except Exception as e:
-        print(f"\n❌ Test failed with error: {e}")
-        import traceback
-        traceback.print_exc()
-        all_passed = False
-
-    print("\n" + "=" * 70)
-    if all_passed:
-        print("✅ ALL TESTS PASSED")
-    else:
-        print("❌ SOME TESTS FAILED")
-    print("=" * 70)
-
-    sys.exit(0 if all_passed else 1)
+    sys.exit(pytest.main([__file__, "-v"]))

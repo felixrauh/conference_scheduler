@@ -15,12 +15,13 @@ Usage:
     python examples/load_data.py examples/orbel2017
 """
 
-from src.data_loader import ConferenceData, load_from_csv_dir
 import sys
 from pathlib import Path
 
-# Add parent to path for imports
+# Add the repository root to the path so `src` can be imported
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.data_loader import load_from_csv_dir  # noqa: E402
 
 
 def load_conference_data(data_dir: str, **kwargs):
@@ -77,11 +78,19 @@ def main():
 
     print("-" * 40)
     print("Validation:")
-    data.validate()
-    print("  All checks passed!")
+    errors = data.validate()
+    for err in errors:
+        print(f"  - {err}")
+    if not errors:
+        print("  All checks passed!")
 
-    return 0
+    n_slots = data.total_talk_slots()
+    if n_slots > len(data.talks):
+        print(f"  Note: {n_slots - len(data.talks)} of {n_slots} slots will "
+              f"be left empty (filled with placeholders).")
+
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())

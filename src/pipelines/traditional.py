@@ -82,7 +82,8 @@ def run_traditional_pipeline(config: PipelineConfig, instance, data) -> Dict[str
     # -------------------------------------------------------------------------
     fixed_sequence_talks = set()
     fixed_sequences_for_phase2 = []
-    adjusted_block_types = dict(instance.block_types)  # Copy for modification
+    # Copy (including the inner dicts) so instance.block_types stays untouched
+    adjusted_block_types = {k: dict(v) for k, v in instance.block_types.items()}
 
     if config.fixed_sequences:
         print(
@@ -168,6 +169,10 @@ def run_traditional_pipeline(config: PipelineConfig, instance, data) -> Dict[str
         tuples_by_size = {}
         phase1_obj = 0.0
         print("  ✓ Skipped (all blocks pre-specified)")
+    elif config.phase1_method not in ("column_generation", "explicit"):
+        raise ValueError(
+            f"Unknown phase1_method '{config.phase1_method}'. "
+            f"Use 'column_generation' or 'explicit'.")
     elif config.phase1_method == "column_generation":
         # Need to create adjusted instance for column generation
         tuples_by_size, phase1_obj, phase1_cols = _run_phase1_column_generation(
@@ -283,12 +288,12 @@ def run_traditional_pipeline(config: PipelineConfig, instance, data) -> Dict[str
 
     phase3_start = time.time()
 
-    if config.phase3_method == "milp":
-        phase3_result = solve_phase3(phase3_input, verbose=config.verbose)
-    else:
-        from src.pipelines.heuristic import solve_phase3_hungarian
-        phase3_result = solve_phase3_hungarian(
-            phase2_result.blocks, data, instance)
+    phase3_result = solve_phase3(
+        phase3_input,
+        method=config.phase3_method,
+        time_limit=config.phase3_time_limit,
+        verbose=config.verbose
+    )
 
     results['phase3_time'] = time.time() - phase3_start
     results['phase3_result'] = phase3_result
@@ -321,9 +326,30 @@ def _derive_tuple_types(block_types: Dict) -> List[tuple]:
 
 
 def _run_phase1_column_generation(talks, instance, tuple_types, config):
-    """Run Phase 1 using column generation."""
+    """
+    Run Phase 1 using column generation.
+
+    The greedy solution of the heuristic pipeline seeds the column pool and
+    the final MIP, so the result is never worse than that greedy solution.
+    """
     import gurobipy as gp
     from src.columngeneration_phase1.phase1_column_generation_enhanced import Phase1ColumnGenerationEnhanced
+    from src.instance import compute_infeasible_talk_pairs, compute_forbidden_tuple_sizes
+    from src.pipelines.heuristic import _greedy_phase1, _compute_tuple_cost
+
+    greedy_by_size = _greedy_phase1(
+        talks,
+        instance.preferences,
+        tuple_types,
+        talk_presenter=instance.talk_presenter,
+        infeasible_pairs=compute_infeasible_talk_pairs(instance),
+        forbidden_sizes=compute_forbidden_tuple_sizes(instance),
+        max_time=config.phase1_time_limit
+    )
+    greedy_tuples = [t for tuples in greedy_by_size.values() for t in tuples]
+    greedy_cost = sum(_compute_tuple_cost(t, instance.preferences)
+                      for t in greedy_tuples)
+    print(f"  Greedy start solution: {greedy_cost} missed attendances")
 
     with gp.Env(empty=True) as env:
         env.setParam('OutputFlag', 0)
@@ -336,7 +362,8 @@ def _run_phase1_column_generation(talks, instance, tuple_types, config):
             instance.preferences,
             tuple_types,
             pricing_strategy=config.phase1_pricing_strategy,
-            verbose=config.verbose
+            verbose=config.verbose,
+            initial_columns=greedy_tuples
         )
 
         result = solver.solve(

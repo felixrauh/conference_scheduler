@@ -9,56 +9,41 @@ This script loads a schedule and computes quality metrics:
 4. Presenter violations (unavailable timeslots)
 
 Usage:
-    # Evaluate with preferences
+    # Evaluate against a data directory (preferences, talks, availability)
+    python scripts/evaluate_schedule.py output/schedule.csv \\
+        --data-dir examples/orbel2026
+
+    # Or point to the individual files
     python scripts/evaluate_schedule.py output/schedule.csv \\
         --preferences examples/orbel2026/preferences.csv \\
         --talks examples/orbel2026/talks.csv
 
-    # Quick evaluation (no preferences = just count violations and coherence)
+    # Full evaluation with verbose output and JSON export
     python scripts/evaluate_schedule.py output/schedule.csv \\
-        --talks examples/orbel2026/talks.csv
-
-    # Full evaluation with verbose output
-    python scripts/evaluate_schedule.py output/schedule.csv \\
-        --preferences examples/orbel2026/preferences.csv \\
-        --talks examples/orbel2026/talks.csv \\
+        --data-dir examples/orbel2026 \\
         --output-json output/evaluation_metrics.json -v
 
-Note: Presenter IDs are derived from Talk_IDs (T029 -> P029), so no Presenter_ID
-column is required in the schedule CSV.
+Presenter IDs are read from talks.csv. Without --talks/--data-dir they are
+derived from Talk_IDs (T029 -> P029).
 """
 
-from collections import defaultdict
-import pandas as pd
-from src.schedule_evaluator import (
-    ScheduleEvaluator,
-    EvaluationMetrics,
-    load_schedule_csv,
-    load_keywords_from_csv,
-    load_preferences_from_csv,
-)
 import sys
 import argparse
 import json
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-
-def load_availability_from_csv(csv_path: str) -> dict:
-    """Load presenter unavailability from CSV."""
-    if not Path(csv_path).exists():
-        return {}
-
-    df = pd.read_csv(csv_path)
-    unavailability = defaultdict(set)
-
-    for _, row in df.iterrows():
-        pres_id = str(row['presenter_id'])
-        ts_id = str(row['unavailable_timeslot'])
-        unavailability[pres_id].add(ts_id)
-
-    return dict(unavailability)
+from src.schedule_evaluator import (  # noqa: E402
+    ScheduleEvaluator,
+    load_availability_from_csv,
+    load_keywords_from_csv,
+    load_preferences_from_csv,
+    load_schedule_csv,
+    load_talk_presenters_from_csv,
+)
 
 
 def load_constraints_from_excel(
@@ -127,105 +112,6 @@ def load_constraints_from_excel(
     return presenter_id_unavailability
 
 
-def extract_talk_keywords_from_schedule(
-    schedule_df: pd.DataFrame,
-    talks_csv: str = None,
-    verbose: bool = False
-) -> dict:
-    """
-    Build talk_id -> keywords mapping.
-
-    First tries data/output/talks_for_algorithm.csv (has talk_id directly),
-    then falls back to title-based matching from talks_csv.
-    """
-    talk_keywords = {}
-
-    # Try talks_for_algorithm.csv first (same as pipeline)
-    algo_file = Path("data/output/talks_for_algorithm.csv")
-    if algo_file.exists():
-        try:
-            algo_df = pd.read_csv(algo_file)
-            for _, row in algo_df.iterrows():
-                # talk_id in this file is numeric, schedule uses T### format
-                talk_id = f"T{row['talk_id']:03d}"
-                kw_str = str(row.get('keywords', ''))
-                if pd.notna(kw_str) and kw_str.lower() != 'nan':
-                    keywords = set(kw.strip()
-                                   for kw in kw_str.split(';') if kw.strip())
-                else:
-                    keywords = set()
-                talk_keywords[talk_id] = keywords
-            if verbose:
-                print(
-                    f"  Loaded keywords for {len(talk_keywords)} talks from talks_for_algorithm.csv")
-            return talk_keywords
-        except Exception as e:
-            if verbose:
-                print(
-                    f"  Warning: Could not load from talks_for_algorithm.csv: {e}")
-
-    # Fallback to talks_csv
-    if not talks_csv:
-        return talk_keywords
-
-    talks_df = pd.read_csv(talks_csv)
-
-    # If talks_csv has a 'keywords' column and numeric talk_ids, map directly
-    if 'keywords' in talks_df.columns and 'talk_id' in talks_df.columns:
-        try:
-            for _, row in talks_df.iterrows():
-                talk_id = f"T{int(row['talk_id']):03d}"
-                kw_str = str(row.get('keywords', ''))
-                if pd.isna(kw_str) or kw_str.lower() == 'nan':
-                    keywords = set()
-                else:
-                    keywords = set(kw.strip()
-                                   for kw in kw_str.split(';') if kw.strip())
-                talk_keywords[talk_id] = keywords
-            if verbose:
-                print(f"  Loaded keywords for {len(talk_keywords)} talks")
-            return talk_keywords
-        except (ValueError, TypeError):
-            pass  # Fall through to title-based matching
-
-    # Title-based matching (for files with 'title' and 'master_keywords' columns)
-    if 'title' not in talks_df.columns:
-        if verbose:
-            print("  Warning: Could not load keywords: talks CSV has no 'title' or 'keywords' column")
-        return talk_keywords
-
-    title_to_keywords = {}
-    for _, row in talks_df.iterrows():
-        title = str(row['title']).strip().lower()
-        kw_str = str(row.get('master_keywords', ''))
-        if pd.isna(kw_str) or kw_str.lower() == 'nan':
-            keywords = set()
-        else:
-            keywords = set(kw.strip()
-                           for kw in kw_str.split(';') if kw.strip())
-        title_to_keywords[title] = keywords
-
-    # Map talk_id -> keywords using titles from schedule
-    if 'Title' in schedule_df.columns:
-        for _, row in schedule_df.iterrows():
-            talk_id = row['Talk_ID']
-            title = str(row['Title']).strip().lower()
-            talk_keywords[talk_id] = title_to_keywords.get(title, set())
-    else:
-        # Assume talk_id like "T001" corresponds to row 1 in talks_csv
-        for talk_id in schedule_df['Talk_ID'].unique():
-            try:
-                idx = int(talk_id[1:]) - 1  # T001 -> index 0
-                if 0 <= idx < len(talks_df):
-                    title = str(talks_df.iloc[idx]['title']).strip().lower()
-                    talk_keywords[talk_id] = title_to_keywords.get(
-                        title, set())
-            except (ValueError, IndexError):
-                talk_keywords[talk_id] = set()
-
-    return talk_keywords
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate a conference schedule quality"
@@ -235,12 +121,17 @@ def main():
         help="Path to schedule CSV file"
     )
     parser.add_argument(
+        "--data-dir", "-d",
+        help="Input data directory; supplies preferences.csv, talks.csv and "
+             "availability.csv unless given explicitly"
+    )
+    parser.add_argument(
         "--preferences",
         help="Path to preferences CSV (participant_id, talk_id format)"
     )
     parser.add_argument(
         "--talks",
-        help="Path to talks CSV with keywords"
+        help="Path to talks CSV (talk_id, presenter_id, keywords)"
     )
     parser.add_argument(
         "--availability",
@@ -262,6 +153,16 @@ def main():
 
     args = parser.parse_args()
 
+    # Fill in file paths from --data-dir
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+        if not args.preferences and (data_dir / "preferences.csv").exists():
+            args.preferences = str(data_dir / "preferences.csv")
+        if not args.talks and (data_dir / "talks.csv").exists():
+            args.talks = str(data_dir / "talks.csv")
+        if not args.availability and (data_dir / "availability.csv").exists():
+            args.availability = str(data_dir / "availability.csv")
+
     # Load schedule
     print(f"Loading schedule from {args.schedule}...")
     schedule_df = load_schedule_csv(args.schedule)
@@ -282,28 +183,28 @@ def main():
         except Exception as e:
             print(f"  Warning: Could not load preferences: {e}")
 
-    # Load keywords (tries talks_for_algorithm.csv first, then falls back to --talks)
+    # Load keywords and presenters from talks.csv
     talk_keywords = {}
-    print(f"\nLoading keywords...")
-    try:
-        talk_keywords = extract_talk_keywords_from_schedule(
-            schedule_df, args.talks, verbose=args.verbose
-        )
-        talks_with_kw = sum(1 for kws in talk_keywords.values() if kws)
-        print(
-            f"  Found keywords for {talks_with_kw}/{len(talk_keywords)} talks")
-    except Exception as e:
-        print(f"  Warning: Could not load keywords: {e}")
-
-    # Build talk_presenter from schedule (derive from Talk_ID: T029 -> P029)
     talk_presenter = {}
+    if args.talks:
+        print(f"\nLoading talks from {args.talks}...")
+        try:
+            talk_keywords, _ = load_keywords_from_csv(args.talks)
+            talk_presenter = load_talk_presenters_from_csv(args.talks)
+            talks_with_kw = sum(1 for kws in talk_keywords.values() if kws)
+            print(
+                f"  Found keywords for {talks_with_kw}/{len(talk_keywords)} talks")
+        except Exception as e:
+            print(f"  Warning: Could not load talks: {e}")
+
+    # Fill in presenters missing from talks.csv (derive from Talk_ID: T029 -> P029)
     presenter_names = {}  # presenter_id -> name for constraint matching
     for _, row in schedule_df.iterrows():
         talk_id = row['Talk_ID']
-        # Derive presenter_id from talk_id (T029 -> P029)
-        presenter_id = talk_id.replace(
-            'T', 'P') if talk_id.startswith('T') else talk_id
-        talk_presenter[talk_id] = presenter_id
+        if talk_id not in talk_presenter:
+            talk_presenter[talk_id] = talk_id.replace(
+                'T', 'P', 1) if talk_id.startswith('T') else talk_id
+        presenter_id = talk_presenter[talk_id]
         # Get presenter name for constraint matching
         name = row.get('Primary_Contact_Author')
         if pd.notna(name):

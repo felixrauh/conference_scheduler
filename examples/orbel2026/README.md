@@ -14,6 +14,9 @@ Anonymized conference scheduling data in standardized format.
   - `talk_id`: Talk the participant wants to attend
 
 - `sessions.csv` - Conference structure (rooms × talks per session block)
+  (123 slots for 118 talks: 5 slots stay empty and appear as `PLACEHOLDER_<n>` in the output)
+
+There is no `availability.csv` for this dataset; `examples/synthetic/` shows the availability format.
 
 ## Statistics
 - 118 talks

@@ -44,23 +44,6 @@ class PipelineConfig:
     max_feasibility_retries: int = 10
 
 
-@dataclass
-class RoomAssignment:
-    """Assignment of room positions to physical rooms for a block."""
-    block: Any
-    timeslot: Dict
-    room_mapping: Dict[int, str]
-    violations: int = 0
-
-
-@dataclass
-class Phase3Result:
-    """Complete Phase 3 output."""
-    assignments: List[RoomAssignment]
-    total_violations: int
-    total_capacity_gap: int
-
-
 def run_heuristic_pipeline(config: PipelineConfig, instance, data) -> Dict[str, Any]:
     """
     Run the heuristic pipeline (no Gurobi required).
@@ -83,7 +66,8 @@ def run_heuristic_pipeline(config: PipelineConfig, instance, data) -> Dict[str, 
     # -------------------------------------------------------------------------
     fixed_sequence_talks = set()
     fixed_sequences_for_phase2 = []
-    adjusted_block_types = dict(instance.block_types)  # Copy for modification
+    # Copy (including the inner dicts) so instance.block_types stays untouched
+    adjusted_block_types = {k: dict(v) for k, v in instance.block_types.items()}
 
     if config.fixed_sequences:
         print(
@@ -275,13 +259,12 @@ def run_heuristic_pipeline(config: PipelineConfig, instance, data) -> Dict[str, 
     return results
 
 
-def solve_phase3_hungarian(blocks, data, instance) -> Phase3Result:
+def solve_phase3_hungarian(blocks, data, instance):
     """
-    Solve Phase 3 using Hungarian algorithm (no Gurobi).
+    Solve Phase 3 using the Hungarian algorithm (no Gurobi).
 
-    Assigns blocks to timeslots while:
-    1. Respecting block type ↔ timeslot type_id matching (must be exact)
-    2. Minimizing presenter constraint violations
+    Assigns blocks to timeslots of matching type while minimizing presenter
+    availability violations. Thin wrapper around src.phase3.solve_phase3.
 
     Args:
         blocks: List of blocks from Phase 2
@@ -291,94 +274,20 @@ def solve_phase3_hungarian(blocks, data, instance) -> Phase3Result:
     Returns:
         Phase3Result with assignments
     """
-    from scipy.optimize import linear_sum_assignment
-    import numpy as np
+    from src.phase3 import Phase3Input, solve_phase3
 
-    n_blocks = len(blocks)
-    timeslots = data.timeslots[:n_blocks]
+    if not data.room_capacities:
+        data.room_capacities = {room: 100 for room in data.rooms}
 
-    talk_presenter = {
-        row['talk_id']: row['presenter_id']
-        for _, row in data.talks.iterrows()
-    }
-
-    # Create cost matrix (violations + type mismatch penalty)
-    INCOMPATIBLE_PENALTY = 1000000  # Large penalty for type mismatch
-    cost_matrix = []
-
-    # Print type info for debugging
-    block_type_counts = {}
-    for block in blocks:
-        bt = block.block_type
-        block_type_counts[bt] = block_type_counts.get(bt, 0) + 1
-
-    timeslot_type_counts = {}
-    for ts in timeslots:
-        tt = ts.get('type_id', 'unknown')
-        timeslot_type_counts[tt] = timeslot_type_counts.get(tt, 0) + 1
-
-    print(f"  Block types: {block_type_counts}")
-    print(f"  Timeslot types: {timeslot_type_counts}")
-
-    for block in blocks:
-        row = []
-        block_type = block.block_type
-
-        for ts in timeslots:
-            ts_type = ts.get('type_id', block_type)  # Fallback for legacy
-
-            # Check exact type compatibility: block_type must match type_id
-            if block_type != ts_type:
-                row.append(INCOMPATIBLE_PENALTY)
-                continue
-
-            # Calculate presenter violations
-            violations = 0
-            for ntuple in block.tuples:
-                for talk_id in ntuple:
-                    presenter = talk_presenter.get(talk_id)
-                    if presenter:
-                        unavail = instance.presenter_unavailability.get(
-                            presenter, set())
-                        ts_id = ts.get('id', ts) if isinstance(
-                            ts, dict) else ts
-                        if ts_id in unavail:
-                            violations += 1
-            row.append(violations)
-        cost_matrix.append(row)
-
-    # Solve assignment
-    cost_array = np.array(cost_matrix)
-    row_ind, col_ind = linear_sum_assignment(cost_array)
-
-    # Build assignments
-    assignments = []
-    rooms = list(data.rooms)[:5]  # Max 5 rooms
-
-    for block_idx, ts_idx in zip(row_ind, col_ind):
-        block = blocks[block_idx]
-        timeslot = timeslots[ts_idx]
-        n_rooms = len(block.tuples[0]) if block.tuples else 0
-
-        # Simple room mapping
-        room_mapping = {
-            i: rooms[i] if i < len(rooms) else f"Room_{i}"
-            for i in range(n_rooms)
-        }
-
-        assignments.append(RoomAssignment(
-            block=block,
-            timeslot=timeslot if isinstance(timeslot, dict) else {
-                'id': timeslot},
-            room_mapping=room_mapping,
-            violations=int(cost_array[block_idx, ts_idx])
-        ))
-
-    return Phase3Result(
-        assignments=assignments,
-        total_violations=int(cost_array[row_ind, col_ind].sum()),
-        total_capacity_gap=0
+    phase3_input = Phase3Input(
+        blocks=blocks,
+        timeslots=data.timeslots,
+        room_capacities=data.room_capacities,
+        talk_presenter=instance.talk_presenter,
+        presenter_unavailability=instance.presenter_unavailability,
+        preferences=instance.preferences
     )
+    return solve_phase3(phase3_input, method="hungarian", verbose=False)
 
 
 def _derive_tuple_types(block_types: Dict) -> List[Tuple[int, int]]:
@@ -435,6 +344,8 @@ def _greedy_phase1(
     3. Greedily construct tuples minimizing conflict
     4. Respect same-presenter, infeasible pair, and tuple size constraints
 
+    Deterministic: ties are broken by the order of `talks`.
+
     Args:
         talks: List of talk IDs
         preferences: Participant preferences
@@ -472,9 +383,15 @@ def _greedy_phase1(
         for i in range(n_placeholders):
             all_talks.append(f"PLACEHOLDER_{i+1}")
 
-    # Greedy construction
+    # Greedy construction. `remaining` is a set for fast lookups; it is always
+    # iterated in input order, so that ties are broken the same way in every
+    # run (set order of strings changes between Python processes).
     tuples_by_size: Dict[int, List[Tuple[str, ...]]] = {}
     remaining = set(all_talks)
+    position = {t: i for i, t in enumerate(all_talks)}
+
+    def in_order(talk_set) -> List[str]:
+        return sorted(talk_set, key=position.__getitem__)
 
     # Pre-compute how many talks are needed and eligible for each size
     size_needs: Dict[int, int] = {n: n * count for n, count in tuple_types}
@@ -525,7 +442,7 @@ def _greedy_phase1(
 
             # Filter candidates: only talks that CAN be in size-n tuples
             eligible = [
-                t for t in remaining if n not in forbidden_sizes.get(t, set())]
+                t for t in in_order(remaining) if n not in forbidden_sizes.get(t, set())]
 
             # Also exclude reserved talks for OTHER sizes (they should be saved for their required size)
             other_reserved = set()
@@ -542,7 +459,7 @@ def _greedy_phase1(
 
             if not eligible:
                 # Fallback: all remaining talks (shouldn't happen with proper constraints)
-                eligible = list(remaining)
+                eligible = in_order(remaining)
 
             # PRIORITY: If there are restricted talks still remaining, start with one of them
             # This ensures restricted talks get placed in larger sizes before we run out of slots
@@ -591,7 +508,7 @@ def _greedy_phase1(
                 if not feasible:
                     # No feasible candidates - try adding from all remaining (not just eligible)
                     fallback = [
-                        t for t in remaining if t not in current and can_add(t)]
+                        t for t in in_order(remaining) if t not in current and can_add(t)]
                     if fallback:
                         feasible = fallback
                     else:
@@ -603,7 +520,8 @@ def _greedy_phase1(
                     pair_costs.get(tuple(sorted([t, c])), 0) for c in current
                 ))
                 current.append(best)
-                pool.remove(best)
+                if best in pool:
+                    pool.remove(best)
 
             if len(current) == n:
                 tuples_by_size[n].append(tuple(current))

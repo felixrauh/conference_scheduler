@@ -13,10 +13,18 @@
     // -------------------------------------------------------------------------
     // PIPELINE SELECTION
     // -------------------------------------------------------------------------
-    // "traditional" - 3-phase optimization (Phase 1→2→3), requires Gurobi
-    // "heuristic"   - Greedy/scipy-based alternative (no Gurobi needed)
-    // "matching"    - Bottom-up matching pipeline (requires Gurobi)
+    // "traditional"          - 3-phase optimization (Phase 1→2→3), requires Gurobi
+    // "heuristic"            - Greedy/scipy-based alternative (no Gurobi needed)
+    // "matching"             - Bottom-up matching pipeline (requires Gurobi)
+    // "matching_constrained" - Matching with group/keyword constraints (requires Gurobi)
     "pipeline": "traditional",
+    // -------------------------------------------------------------------------
+    // RANDOM SEED
+    // -------------------------------------------------------------------------
+    // Seeds the randomized steps (local search, sampling). The same input and
+    // seed always give the same schedule; try other seeds for alternatives.
+    // CLI: --seed
+    "seed": 0,
     // -------------------------------------------------------------------------
     // INPUT DATA
     // -------------------------------------------------------------------------
@@ -39,7 +47,9 @@
     // Defines blocks: n rooms × k timeslots × count blocks.
     //
     // "auto" = read from sessions.csv (recommended).
-    // Override only if sessions.csv doesn't match your needs.
+    // Override only if sessions.csv doesn't match your needs. An override
+    // creates timeslots named "<type>_1", "<type>_2", ... (or "<type>" if
+    // count is 1); availability.csv and fixed sessions must use these names.
     //
     // Examples:
     //   "block_types": {"5R4T": {"n": 5, "k": 4, "count": 3}}
@@ -52,13 +62,14 @@
     // PHASE 1: TUPLE SELECTION
     // -------------------------------------------------------------------------
     // Group talks into parallel tuples, minimizing missed attendance.
+    // The method applies to the "traditional" pipeline; the "heuristic"
+    // pipeline always uses its own greedy construction (only time_limit applies).
     "phase1": {
         // Method:
         // - "column_generation": Generates tuples on-demand (recommended, requires Gurobi)
         // - "explicit": Enumerates all tuples with heuristic filtering (requires Gurobi)
-        // - "greedy": Fast heuristic (no Gurobi needed, used by heuristic pipeline)
         "method": "column_generation",
-        // Solver time limit in seconds
+        // Solver time limit in seconds (CLI: --time-limit)
         "time_limit": 120.0,
         // Explicit enumeration options (only used when method = "explicit")
         "explicit": {
@@ -78,6 +89,8 @@
     // PHASE 2: BLOCK ASSEMBLY & ORDERING
     // -------------------------------------------------------------------------
     // Partition tuples into blocks and order talks to minimize room hopping.
+    // partition_strategy applies to the "traditional" pipeline only; the
+    // "heuristic" pipeline always uses "matching".
     "phase2": {
         // Partition strategy: "matching" | "greedy" | "random"
         // - matching: Best quality (paper's approach, uses assignment + perfect matching)
@@ -96,7 +109,8 @@
         // Talks that run SEQUENTIALLY in ONE ROOM. They skip Phase 1 optimization
         // and get attached as an extra room-column in Phase 2.
         //
-        // Only used by "traditional" and "heuristic" pipelines.
+        // Only used by "traditional" and "heuristic" pipelines. Talks keep the
+        // given order. To also fix the timeslot, use phase4.fixed_block_sessions.
         //
         // Each entry:
         // - name: Descriptive name (e.g., "SpecialSession_1")
@@ -115,6 +129,7 @@
     // Assign blocks to timeslots, respecting presenter availability.
     "phase3": {
         // Method: "milp" (Gurobi) | "hungarian" (scipy, no Gurobi needed)
+        // The "heuristic" pipeline always uses "hungarian".
         "method": "milp",
         // Solver time limit in seconds
         "time_limit": 60.0
@@ -126,7 +141,9 @@
     // remain. This phase swaps talks between positions to resolve them
     // while minimizing impact on attendance and keyword coherence.
     //
-    // Requires availability.csv in the data directory to have any effect.
+    // Presenter violations need availability.csv in the data directory.
+    // Placeholder (empty-slot) violations are resolved whenever sessions.csv
+    // has more slots than there are talks.
     "swap_optimization": {
         "enabled": true,
         // Weight for keyword coherence vs missed attendance (0.0-1.0)
@@ -135,10 +152,10 @@
         "keyword_weight": 0.1,
         // Maximum swap iterations
         "max_iterations": 100,
-        // Also resolve dummy talk placement violations
-        // (dummy in short block, or 2+ dummies in same room-session)
+        // Also resolve placeholder (empty slot) placement violations
+        // (placeholder in a short block, or 2+ in the same room-session)
         "check_dummy_violations": true,
-        // Blocks with k ≤ this threshold are "short" — dummies there are violations
+        // Blocks with k ≤ this threshold are "short" — placeholders there are violations
         "short_block_threshold": 3
     },
     // -------------------------------------------------------------------------
@@ -147,13 +164,17 @@
     // Computes session metrics, assigns rooms by audience size, and adds
     // any fixed block sessions.
     //
-    // Room assignment: smallest audience → smallest room (greedy, optimal).
+    // Room assignment: fewest total likes → smallest room (greedy, optimal).
     "phase4": {
         // -------------------------------------------------------------------------
         // FIXED BLOCK SESSIONS (Pre-specified sessions for specific blocks)
         // -------------------------------------------------------------------------
         // Talks that are pre-assigned to both a session grouping AND a specific
-        // block/timeslot. These are excluded from Phases 1-3 entirely.
+        // block/timeslot. These are excluded from Phases 1-3 entirely. Works
+        // with all pipelines.
+        //
+        // Keep sessions.csv unchanged: one room of the target block is reserved
+        // automatically for each fixed session.
         //
         // Different from fixed_sequences (above): fixed_sequences let the
         // optimizer choose which timeslot; fixed_block_sessions lock in both
@@ -174,22 +195,29 @@
     // -------------------------------------------------------------------------
     // MATCHING PIPELINE SETTINGS
     // -------------------------------------------------------------------------
-    // Only used when pipeline = "matching".
+    // Used when pipeline = "matching" or "matching_constrained".
     // Bottom-up approach: pair talks → form blocks → select tuples → order.
+    // Only sessions with 3 or 4 talks per room are supported.
     // See docs/matching_pipeline_specification.md for details.
     "matching_pipeline": {
         // Total time limit across all phases (distributed automatically:
-        // 15% pairing, 15% block formation, 40% tuple selection, 30% ordering)
-        "time_limit": 300.0
+        // 15% pairing, 15% block formation, 50% tuple selection, 20% room assignment)
+        "time_limit": 300.0,
+        // matching_constrained only: talks in the same room-session must share
+        // a keyword (hard constraint; CLI: --require-keyword)
+        "require_common_keyword": false,
+        // matching_constrained only: soft keyword constraint. Starting budget of
+        // pairs without a shared keyword, raised until feasible; 0 = as few as
+        // possible, null = off (CLI: --max-violations)
+        "max_keyword_violations": null
     },
     // -------------------------------------------------------------------------
     // ROOMS
     // -------------------------------------------------------------------------
     // Physical rooms with capacities. Used in Phase 4 for room assignment
-    // (smallest audience → smallest room).
-    // Room names and capacities are optional. If omitted, rooms are numbered
-    // automatically. When provided, rooms are assigned by audience size
-    // (smallest audience → smallest room).
+    // (fewest total likes → smallest room).
+    // Optional. If omitted, rooms are numbered automatically (Room_1, ...).
+    // When provided, list at least as many rooms as the largest block needs.
     "rooms": [
         {"id": "A", "name": "Room A", "capacity": 250},
         {"id": "B", "name": "Room B", "capacity": 120},

@@ -24,6 +24,7 @@ talk_id,presenter_id,keywords
 1,1,"optimization; scheduling"
 2,2,"machine learning"
 ```
+`keywords` is optional. Further optional columns: `title`, `presenter_name`, `authors`, `special_group` (see the main README).
 
 ### `preferences.csv` (long format)
 ```
@@ -40,7 +41,7 @@ TA,5,4
 TB,5,4
 TC,4,3
 ```
-Each row defines one session block (timeslot): `n_rooms` parallel rooms, each with `n_talks_per_room` sequential talks. The total slots (`sum of n_rooms × n_talks_per_room`) should match the number of talks.
+Each row defines one session block (timeslot): `n_rooms` parallel rooms, each with `n_talks_per_room` sequential talks. The total slots (`sum of n_rooms × n_talks_per_room`) must be at least the number of talks; leftover slots are filled with placeholders (empty slots).
 
 ### `availability.csv` (optional)
 ```
@@ -48,14 +49,14 @@ presenter_id,unavailable_timeslot
 P001,TB
 P002,TA
 ```
-Specifies timeslots where a presenter is unavailable. Presenter IDs use P### format (derived from talk IDs). Used by swap optimization to resolve scheduling conflicts.
+Specifies timeslots where a presenter is unavailable. Presenter IDs refer to the `presenter_id` column of `talks.csv`, either as integers (`1`) or in internal form (`P001`). All pipelines take these constraints into account.
 
 Participant IDs are inferred automatically from `preferences.csv` — no separate participants file is needed.
 
 ## Loading Data
 
 ```bash
-# Test loading from the command line
+# Load and validate a data directory from the command line
 python examples/load_data.py examples/orbel2026
 ```
 
@@ -73,18 +74,19 @@ instance = build_instance(data)
 ## Command Line
 
 ```bash
-# Test loading
+# Load and validate
 python examples/load_data.py examples/orbel2026
 
-# Run full scheduling pipeline
-python scripts/run_schedule.py --data-dir examples/orbel2026
+# Run the scheduler (heuristic pipeline, no Gurobi needed)
+python scripts/run_schedule.py --pipeline heuristic --data-dir examples/orbel2026
 ```
 
 ## Creating Your Own Data
 
 1. Create a directory with `talks.csv`, `preferences.csv`, and `sessions.csv`
-2. Use numeric IDs (1, 2, 3, ...) for talks and participants
-3. Keywords are optional but help with topic clustering
+2. Use numeric IDs (1, 2, 3, ...) for talks, presenters and participants
+3. Keywords are optional but enable the coherence metric and keyword constraints
+4. Check it with `python examples/load_data.py path/to/my_conference`
 
 Minimal example:
 ```

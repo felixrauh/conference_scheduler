@@ -30,6 +30,8 @@ from collections import defaultdict
 from pathlib import Path
 import pandas as pd
 
+from .utils import is_placeholder
+
 
 @dataclass
 class EvaluationMetrics:
@@ -390,6 +392,7 @@ class ScheduleEvaluator:
 
         A room-session is all talks in one room at one timeslot.
         It's incoherent if no keyword appears in all talks of that session.
+        Placeholder talks (empty slots) are ignored.
 
         Returns:
             Tuple of (count, list of detail dicts)
@@ -401,12 +404,13 @@ class ScheduleEvaluator:
         details = []
 
         for (timeslot, room), talk_list in self.talks_by_room_session.items():
-            if len(talk_list) < 2:
+            # Get keywords for each real talk in this room-session
+            talk_ids = [talk_id for (_, talk_id) in talk_list
+                        if not is_placeholder(talk_id)]
+            if len(talk_ids) < 2:
                 # Single talk or empty - coherent by definition
                 continue
 
-            # Get keywords for each talk in this room-session
-            talk_ids = [talk_id for (_, talk_id) in talk_list]
             keyword_sets = [
                 self.talk_keywords.get(talk_id, set())
                 for talk_id in talk_ids
@@ -502,7 +506,8 @@ class ScheduleEvaluator:
 
         # Statistics
         metrics.total_participants_with_preferences = len(self.preferences)
-        metrics.total_talks = len(self.all_talks)
+        metrics.total_talks = sum(
+            1 for t in self.all_talks if not is_placeholder(t))
         metrics.total_timeslots = len(self.timeslots)
         metrics.total_room_sessions = len(self.talks_by_room_session)
 
@@ -682,6 +687,30 @@ def load_preferences_from_instance(preferences_matrix: Dict[str, Set[str]]) -> D
     return preferences_matrix
 
 
+def _normalize_id(value, prefix: str) -> str:
+    """Convert numeric IDs (4, "4", 4.0) to the internal format (e.g. T004)."""
+    s = str(value).strip()
+    try:
+        return f"{prefix}{int(float(s)):03d}"
+    except ValueError:
+        return s
+
+
+def load_talk_presenters_from_csv(talks_csv: str) -> Dict[str, str]:
+    """
+    Load talk_id -> presenter_id from a talks.csv in the standard input format.
+
+    Numeric IDs are converted to the internal T###/P### format.
+    """
+    df = pd.read_csv(talks_csv)
+    if 'talk_id' not in df.columns or 'presenter_id' not in df.columns:
+        return {}
+    return {
+        _normalize_id(t, "T"): _normalize_id(p, "P")
+        for t, p in zip(df['talk_id'], df['presenter_id'])
+    }
+
+
 def load_keywords_from_csv(
     talks_csv: str,
     title_col: str = "title",
@@ -690,6 +719,9 @@ def load_keywords_from_csv(
 ) -> Tuple[Dict[str, Set[str]], Dict[str, str]]:
     """
     Load talk keywords from CSV.
+
+    The standard input format (talk_id, presenter_id, keywords columns) is
+    detected automatically. Otherwise falls back to a title-based format.
 
     Args:
         talks_csv: Path to talks CSV file
@@ -702,7 +734,17 @@ def load_keywords_from_csv(
         - talk_id -> set of keywords (or title -> keywords if no talk_id)
         - title -> talk_id mapping (for cross-referencing)
     """
+    from .data_loader import parse_keywords
+
     df = pd.read_csv(talks_csv)
+
+    # Standard input format: talk_id + keywords
+    if 'talk_id' in df.columns and 'keywords' in df.columns:
+        keywords_by_id = {
+            _normalize_id(t, "T"): parse_keywords(kw)
+            for t, kw in zip(df['talk_id'], df['keywords'])
+        }
+        return keywords_by_id, {}
 
     keywords_by_id = {}
     title_to_id = {}
@@ -739,6 +781,7 @@ def load_availability_from_csv(
     Load presenter unavailability from CSV.
 
     Expected columns: presenter_id, unavailable_timeslot
+    Numeric presenter IDs are converted to the internal P### format.
 
     Returns:
         Dict mapping presenter_id to set of unavailable timeslot_ids
@@ -747,8 +790,8 @@ def load_availability_from_csv(
 
     unavailability = defaultdict(set)
     for _, row in df.iterrows():
-        pres_id = str(row['presenter_id'])
-        ts_id = str(row['unavailable_timeslot'])
+        pres_id = _normalize_id(row['presenter_id'], "P")
+        ts_id = str(row['unavailable_timeslot']).strip()
         unavailability[pres_id].add(ts_id)
 
     return dict(unavailability)
@@ -807,7 +850,9 @@ def evaluate_schedule(
         else:
             presenter_unavailability = {}
 
-    # Build talk_presenter from schedule if not provided
+    # Build talk_presenter from talks.csv (or the schedule) if not provided
+    if talk_presenter is None and talks_csv:
+        talk_presenter = load_talk_presenters_from_csv(talks_csv) or None
     if talk_presenter is None and 'Presenter_ID' in schedule_df.columns:
         talk_presenter = {}
         for _, row in schedule_df.iterrows():

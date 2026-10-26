@@ -2,7 +2,9 @@
 
 ## Overview
 
-This document specifies an alternative pipeline for conference scheduling that builds sessions **bottom-up** by first matching talks into pairs, then assembling pairs into session blocks, and finally optimizing across parallel sessions.
+This document specifies an alternative pipeline for conference scheduling that builds sessions **bottom-up** by first matching talks into pairs, then assembling pairs into session blocks, and finally optimizing across parallel sessions. It is implemented in `src/matching_pipeline.py` (`--pipeline matching`); the constrained variant in `src/matching_pipeline_constrained.py` (`--pipeline matching_constrained`) is described [below](#constrained-variant-matching_constrained).
+
+Only sessions with 3 or 4 talks per room are supported. If `sessions.csv` has more slots than talks, placeholder talks fill the remaining slots, so that $|X| = 3n_3 + 4n_4$ holds.
 
 ### Philosophy
 
@@ -77,7 +79,7 @@ $$y_{ij} \in \{0, 1\} \quad \forall i < j$$
 4. **Presenter unavailability constraint** — infeasible pairs are excluded:
 $$y_{ij} = 0 \quad \forall (i, j) \in \mathcal{I}$$
 
-where $\mathcal{I}$ is the set of talk pairs whose presenters' combined unavailabilities cover all timeslots.
+where $\mathcal{I}$ is the set of talk pairs whose presenters' combined unavailabilities cover at least $\min(5, |S|)$ of the $|S|$ timeslots (`compute_infeasible_talk_pairs`, see [developer_notes.md](developer_notes.md#infeasible-talk-pairs)). This is stricter than "no common timeslot", to avoid pairs with very few options.
 
 ### Output
 
@@ -357,31 +359,22 @@ Given small block sizes ($k \in \{3, 4\}$) and moderate room count ($r \approx 4
 - For 4 rooms with 3-blocks: $(3!)^4 = 1296$
 - For 4 rooms with 4-blocks: $(4!)^4 = 331,776$
 
-**Approach:** Enumerate all orderings, compute benefit, select best.
+**Approach:** Enumerate all orderings and select the one with the highest benefit if there are at most 100,000; otherwise evaluate 50,000 random orderings plus the original order (e.g. 4 rooms with 4-blocks: 331,776 orderings → sampled). Phase D is not time-limited and takes most of the matching pipeline's runtime on the example data.
 
-### Algorithm: Greedy Schedule for Participant
+### Achievable Attendance for a Participant
 
-Given ordered blocks, compute participant $p$'s achievable attendance:
+Because a participant may switch rooms at every timeslot, the achievable attendance is simply the number of timeslots in which at least one of the parallel rooms has a talk they want (`compute_achievable_attendance`):
 
-```
-def achievable_attendance(p, ordered_blocks):
-    # Dynamic programming over timeslots
-    # State: current timeslot, set of attended talks
-    # Transition: for each room, decide attend or not
-    
+```python
+def achievable_attendance(prefs, ordered_blocks):
     k = len(ordered_blocks[0])  # talks per block
-    
-    # dp[t] = max talks attended by end of timeslot t
-    dp = [0] * (k + 1)
-    
-    for t in range(1, k + 1):
-        # Available talks at timeslot t
-        available = [block[t-1] for block in ordered_blocks]
-        best_at_t = max(q(p, talk) for talk in available)
-        dp[t] = dp[t-1] + best_at_t
-    
-    return dp[k]
+    return sum(
+        any(block[t] in prefs for block in ordered_blocks)
+        for t in range(k)
+    )
 ```
+
+The number of room switches this requires is not penalized here; the evaluator's session-hops metric measures it.
 
 ### Output
 
@@ -475,18 +468,21 @@ def achievable_attendance(p, ordered_blocks):
 
 ## Implementation Notes
 
-### Solver Requirements
+### Solvers Used
 
-- **Phase A:** Maximum weight matching with cardinality constraint → MILP or Blossom algorithm
-- **Phase B:** Bipartite/perfect matching → Hungarian algorithm or MILP
-- **Phase C:** Set partitioning → MILP (similar to original Phase 1)
-- **Phase D:** Enumeration or MILP for small instances
+- **Phase A:** Maximum weight matching with cardinality constraint → MILP (Gurobi)
+- **Phase B:** Joint block formation → MILP (Gurobi)
+- **Phase C:** Set partitioning → MILP (Gurobi), similar to the traditional Phase 1
+- **Phase D:** Enumeration, or random sampling for large search spaces
+- **Phase 3:** Shared with the other pipelines (`milp` or `hungarian`)
 
-### Heuristic Alternatives
+The total `matching_pipeline.time_limit` is split as 15% (A), 15% (B), 50% (C, halved on every feasibility retry) and 20% (Phase 3).
 
-1. **Phase A:** Greedy matching by weight
+### Possible Heuristic Alternatives (not implemented)
+
+1. **Phase A:** Greedy matching by weight, or the Blossom algorithm
 2. **Phase B:** Greedy assignment
-3. **Phase C:** Greedy or local search
+3. **Phase C:** Greedy, local search or column generation
 4. **Phase D:** Random restarts with local optimization
 
 ### Presenter Unavailability Feasibility
@@ -494,7 +490,7 @@ def achievable_attendance(p, ordered_blocks):
 The pipeline enforces presenter availability constraints at multiple levels:
 
 **Phase A (Pair Matching):**
-- Compute infeasible talk pairs where combined presenter unavailabilities cover all timeslots
+- Compute infeasible talk pairs where combined presenter unavailabilities cover at least min(5, number of timeslots) timeslots
 - Add constraints `y[i,j] = 0` for all infeasible pairs
 - Example: If presenter A is unavailable for TA/TB and presenter B is unavailable for TC/TD/FA/FB/FC, their talks cannot be paired
 
@@ -509,7 +505,7 @@ The pipeline enforces presenter availability constraints at multiple levels:
   ```
   sum(x[τ] for τ in previous_solution) ≤ |previous_solution| - 1
   ```
-- Retry with reduced time limit (up to `max_feasibility_retries` attempts)
+- Retry with reduced time limit (up to `max_feasibility_retries` = 10 attempts; not exposed in the config file)
 - This ensures the optimizer finds alternative tuple assignments
 
 **Sample Output:**
@@ -529,30 +525,36 @@ PHASE C: Tuple Selection (retry 2)
   Added 2 no-good cuts
 ```
 
-### Configuration Parameters
+### Configuration
 
-```json
-{
-  "matching_pipeline": {
-    "phase_a": {
-      "method": "milp",           // "milp", "greedy", "blossom"
-      "weight_type": "co_preference"  // "co_preference", "co_conflict_inverse"
-    },
-    "phase_b": {
-      "method": "joint_milp",     // "sequential", "joint_milp"
-      "weight_type": "marginal"   // "marginal", "total"
-    },
-    "phase_c": {
-      "method": "milp",           // "milp", "greedy", "column_generation"
-      "cost_type": "block_level"  // "block_level", "talk_level"
-    },
-    "phase_d": {
-      "method": "enumeration",    // "enumeration", "milp", "greedy"
-      "objective": "room_hopping" // "room_hopping", "session_continuity"
-    }
-  }
+Only these settings are read (config section `matching_pipeline`, see [configuration_and_algorithm_reference.md](configuration_and_algorithm_reference.md#matching-pipeline-matching--matching_constrained)):
+
+```jsonc
+"matching_pipeline": {
+    "time_limit": 300.0,                // total, split across phases (CLI: --time-limit)
+    "require_common_keyword": false,    // matching_constrained only (CLI: --require-keyword)
+    "max_keyword_violations": null      // matching_constrained only (CLI: --max-violations)
 }
 ```
+
+The solution methods of Phases A–D are fixed (see above).
+
+---
+
+## Constrained Variant (`matching_constrained`)
+
+`run_constrained_matching_pipeline()` runs the same phases, but Phases A and B only combine talks that are allowed together. Talk metadata comes from `talks.csv`: the optional `special_group` column (empty = `general`) and `keywords`.
+
+| Constraint | Type | Applies to |
+|------------|------|------------|
+| Same `special_group` | Always hard | All talks; talks of different groups are never in one session |
+| Shared keyword (`require_common_keyword`) | Hard | `general` talks (special groups are exempt): matched pairs (Phase A) and every two talks in a block (Phase B) must share a keyword. This is pairwise — the evaluator's coherence metric is stricter (one keyword shared by all talks of a session), so a few sessions can still count as incoherent |
+| Shared keyword (`max_keyword_violations`) | Soft | As above, but up to a violation budget that starts at the given value and grows by 1 until a solution exists |
+| Presenter availability | Hard | Same as the unconstrained pipeline |
+
+Talks without metadata (placeholders) can be combined with any talk. Phases C and D are those of the unconstrained pipeline.
+
+With the hard keyword constraint, Phase A becomes infeasible when there are too few keyword-sharing pairs (e.g. in `examples/orbel2017`, where 46 of 80 talks have no keywords); the soft variant always finds a solution.
 
 ---
 

@@ -9,8 +9,12 @@ import sys
 import pandas as pd
 from pathlib import Path
 
+import pytest
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+pytest.importorskip("gurobipy")
 
 from src.phase1 import Phase1Optimizer, solve_phase1
 from src.instance import ProblemInstance, build_instance
@@ -170,7 +174,9 @@ def test_phase1():
     if extra:
         print(f"  Extra talks: {extra}")
 
-    return result
+    assert not missing, f"Talks not covered: {missing}"
+    assert not extra, f"Unexpected talks: {extra}"
+    assert len(covered_talks) == sum(len(t) for t in result), "Talk used twice"
 
 
 def test_phase1_optimizer_class():

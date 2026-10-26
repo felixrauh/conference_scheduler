@@ -7,6 +7,16 @@ import time
 from functools import wraps
 
 
+# Talk IDs used to fill empty slots when sessions.csv has more slots than
+# talks. The pipelines create "PLACEHOLDER_<i>"; older scripts used "DUMMY_<i>".
+PLACEHOLDER_PREFIXES = ("PLACEHOLDER_", "DUMMY")
+
+
+def is_placeholder(talk_id) -> bool:
+    """True if talk_id is a placeholder (empty slot) rather than a real talk."""
+    return str(talk_id).startswith(PLACEHOLDER_PREFIXES)
+
+
 def timer(func):
     """Decorator to time function execution."""
     @wraps(func)
@@ -70,7 +80,7 @@ def compute_hopping_stats(
     for p_id, prefs in preferences.items():
         total = 0
         for block in blocks:
-            total += compute_hopping_number(block, prefs)
+            total += compute_hopping_number(block.tuples, prefs)
         hops_per_participant[p_id] = total
 
     all_hops = list(hops_per_participant.values())

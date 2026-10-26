@@ -854,11 +854,17 @@ def partition_tuples_matching_based(
 
     # Use MILP version if we have forbidden matchings (for no-good cuts)
     if forbidden_matchings:
-        matching = minimum_cost_perfect_matching_milp(
-            nodes, edge_costs,
-            forbidden_matchings=forbidden_matchings,
-            verbose=verbose
-        )
+        try:
+            matching = minimum_cost_perfect_matching_milp(
+                nodes, edge_costs,
+                forbidden_matchings=forbidden_matchings,
+                verbose=verbose
+            )
+        except ImportError:
+            # No Gurobi: explore a different matching by perturbing edge costs
+            rng = random.Random(len(forbidden_matchings))
+            perturbed = {e: c + rng.random() for e, c in edge_costs.items()}
+            matching = minimum_cost_perfect_matching(nodes, perturbed)
     else:
         matching = minimum_cost_perfect_matching(nodes, edge_costs)
 
@@ -1587,6 +1593,28 @@ def check_all_blocks_feasibility(
 # Main Phase 2 Solver
 # =============================================================================
 
+def _attach_fixed_sequence(
+    tuple_group: List[Tuple[str, ...]],
+    fixed_talks: Tuple[str, ...],
+    preferences: Dict[str, Set[str]],
+    ordering_strategy: str = "enumerate"
+) -> List[Tuple[str, ...]]:
+    """
+    Add a fixed sequence as an extra room to a block, keeping its talk order.
+
+    Talk i of the sequence runs in timeslot i. With the "enumerate" strategy,
+    the block's own tuples are ordered to minimize hopping given that
+    constraint; otherwise they keep their current order.
+    """
+    def expand(tuples):
+        return [tuple(tup) + (talk,) for tup, talk in zip(tuples, fixed_talks)]
+
+    if ordering_strategy != "enumerate":
+        return expand(tuple_group)
+    return min((expand(perm) for perm in permutations(tuple_group)),
+               key=lambda expanded: compute_block_hopping(expanded, preferences))
+
+
 def solve_phase2(
     phase2_input: Phase2Input,
     partition_strategy: str = "greedy",
@@ -1691,6 +1719,8 @@ def solve_phase2(
     # Each fixed sequence adds a "column" (one room) to a block of matching type
     # E.g., a SpecialSession sequence of 4 talks attached to a 4R4T block → 5R4T block
 
+    fixed_order_blocks: Set[int] = set()  # blocks whose tuple order is fixed
+
     if phase2_input.fixed_sequences:
         if verbose:
             print(
@@ -1711,17 +1741,17 @@ def solve_phase2(
                               f"but block has {k} timeslots. Skipping.")
                         continue
 
-                    # Expand each tuple by adding one talk from the sequence
-                    # tuple_group[i] + (fixed_seq.talks[i],) for each timeslot i
-                    expanded_tuples = []
-                    for i, tup in enumerate(tuple_group):
-                        expanded_tuple = tuple(
-                            list(tup) + [fixed_seq.talks[i]])
-                        expanded_tuples.append(expanded_tuple)
+                    # Expand each tuple by adding one talk from the sequence.
+                    # The sequence order is fixed, so order the block's own
+                    # tuples around it now and skip re-ordering in Stage 2.
+                    expanded_tuples = _attach_fixed_sequence(
+                        list(tuple_group), fixed_seq.talks,
+                        phase2_input.preferences, ordering_strategy)
 
                     # Update partition with expanded tuples and new block type
                     partition_list[idx] = (
                         expanded_tuples, fixed_seq.result_block_type)
+                    fixed_order_blocks.add(idx)
                     attached = True
 
                     if verbose:
@@ -1745,11 +1775,15 @@ def solve_phase2(
 
     # Process all partitioned blocks (including those with attached sequences)
     for i, (tuple_group, block_type) in enumerate(partition):
-        ordered_tuples, cost = optimize_block_ordering(
-            list(tuple_group),
-            phase2_input.preferences,
-            strategy=ordering_strategy
-        )
+        if i in fixed_order_blocks:
+            ordered_tuples = list(tuple_group)
+            cost = compute_block_hopping(ordered_tuples, phase2_input.preferences)
+        else:
+            ordered_tuples, cost = optimize_block_ordering(
+                list(tuple_group),
+                phase2_input.preferences,
+                strategy=ordering_strategy
+            )
 
         block = Block(
             block_id=f"B{block_counter:02d}",
@@ -1799,6 +1833,86 @@ def compute_hop_coefficient(
 # =============================================================================
 # Phase 2 with Feasibility Retry Loop
 # =============================================================================
+
+def repair_block_feasibility(
+    blocks: List[Block],
+    preferences: Dict[str, Set[str]],
+    talk_presenter: Dict[str, str],
+    presenter_unavailability: Dict[str, Set[str]],
+    all_timeslots: Set[str],
+    timeslots_by_type: Optional[Dict[str, List[str]]] = None,
+    ordering_strategy: str = "enumerate",
+    max_swaps: int = 100
+) -> Tuple[List[Block], bool]:
+    """
+    Make blocks schedulable by swapping whole tuples between blocks.
+
+    A block is infeasible when no timeslot of its type is available to all
+    of its presenters. Swapping a tuple between two blocks with the same
+    number of rooms keeps every block's shape, so the partition stays valid.
+    Each step applies the swap that makes the most infeasible blocks feasible
+    (ties broken by the smallest hopping increase) without breaking feasible
+    ones; swapped blocks are re-ordered.
+
+    Returns:
+        (blocks, all_feasible)
+    """
+    def feasible(tuples, block_type):
+        probe = Block(block_id="", block_type=block_type,
+                      tuples=tuples, hopping_cost=0)
+        return check_block_feasibility(
+            probe, talk_presenter, presenter_unavailability, all_timeslots,
+            timeslots_by_type=timeslots_by_type)[0]
+
+    blocks = list(blocks)
+    status = [feasible(b.tuples, b.block_type) for b in blocks]
+
+    for _ in range(max_swaps):
+        if all(status):
+            break
+        best = None  # (gain, hopping_delta, i, j, a, c)
+        for i, block_i in enumerate(blocks):
+            if status[i]:
+                continue
+            n = len(block_i.tuples[0])
+            for j, block_j in enumerate(blocks):
+                if j == i or len(block_j.tuples[0]) != n:
+                    continue
+                for a, tuple_a in enumerate(block_i.tuples):
+                    for c, tuple_c in enumerate(block_j.tuples):
+                        new_i = list(block_i.tuples)
+                        new_i[a] = tuple_c
+                        new_j = list(block_j.tuples)
+                        new_j[c] = tuple_a
+                        fi = feasible(new_i, block_i.block_type)
+                        fj = feasible(new_j, block_j.block_type)
+                        if status[j] and not fj:
+                            continue  # never break a feasible block
+                        gain = int(fi) + int(fj) - int(status[j])
+                        if gain <= 0:
+                            continue
+                        delta = (compute_block_hopping(new_i, preferences)
+                                 + compute_block_hopping(new_j, preferences)
+                                 - block_i.hopping_cost - block_j.hopping_cost)
+                        if best is None or (gain, -delta) > (best[0], -best[1]):
+                            best = (gain, delta, i, j, a, c)
+        if best is None:
+            break
+
+        _, _, i, j, a, c = best
+        tuples_i = list(blocks[i].tuples)
+        tuples_j = list(blocks[j].tuples)
+        tuples_i[a], tuples_j[c] = tuples_j[c], tuples_i[a]
+        for idx, tuples in ((i, tuples_i), (j, tuples_j)):
+            ordered, cost = optimize_block_ordering(
+                tuples, preferences, strategy=ordering_strategy)
+            blocks[idx] = Block(block_id=blocks[idx].block_id,
+                                block_type=blocks[idx].block_type,
+                                tuples=ordered, hopping_cost=cost)
+            status[idx] = feasible(ordered, blocks[idx].block_type)
+
+    return blocks, all(status)
+
 
 @dataclass
 class Phase2ResultWithMatching(Phase2Result):
@@ -1896,6 +2010,20 @@ def solve_phase2_with_feasibility_check(
                 else:
                     print(f"  ✓ Partition feasible for presenter constraints")
                 return result, True
+
+            # Cheap local repair: swap tuples between blocks of the same size
+            repaired_blocks, repaired = repair_block_feasibility(
+                result.blocks, phase2_input.preferences, talk_presenter,
+                presenter_unavailability, all_timeslots,
+                timeslots_by_type=timeslots_by_type,
+                ordering_strategy=ordering_strategy)
+            if repaired:
+                print("  ✓ Partition made feasible for presenter constraints "
+                      "by swapping tuples between blocks")
+                return Phase2Result(
+                    blocks=repaired_blocks,
+                    total_hopping=sum(b.hopping_cost for b in repaired_blocks)
+                ), True
 
             if attempt >= max_retries:
                 # Always show failure (important status info)

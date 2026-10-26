@@ -11,6 +11,13 @@ from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import dataclass, field
 
 
+def parse_keywords(kw_str) -> Set[str]:
+    """Parse a ";"-separated keyword string into a set (empty for NaN/blank)."""
+    if kw_str is None or (isinstance(kw_str, float) and pd.isna(kw_str)):
+        return set()
+    return {kw.strip() for kw in str(kw_str).split(";") if kw.strip()}
+
+
 @dataclass
 class ConferenceData:
     """Container for all conference input data."""
@@ -25,7 +32,8 @@ class ConferenceData:
     # Timeslots: list of {"id", "start_time", "type_id", "rooms"}
     timeslots: List[Dict]
 
-    # Talks: DataFrame with columns [talk_id, title, presenter_id, track]
+    # Talks: DataFrame with columns [talk_id, title, presenter_id, keywords]
+    # (keywords is a ";"-separated string, empty if none)
     talks: pd.DataFrame
 
     # Preferences: DataFrame with columns [participant_id, talk_id]
@@ -49,21 +57,35 @@ class ConferenceData:
             for bt in self.block_types.values()
         )
 
+    def talk_keywords(self) -> Dict[str, Set[str]]:
+        """Return {talk_id: set of keywords} for talks that have keywords."""
+        if "keywords" not in self.talks.columns:
+            return {}
+        result = {}
+        for talk_id, kw_str in zip(self.talks["talk_id"], self.talks["keywords"]):
+            keywords = parse_keywords(kw_str)
+            if keywords:
+                result[talk_id] = keywords
+        return result
+
     def validate(self) -> List[str]:
         """
         Validate data integrity. Returns list of error messages (empty if valid).
         Also populates derived data structures.
+
+        Having more slots than talks is not an error: the pipelines fill the
+        remaining slots with placeholder talks. Having more talks than slots is.
         """
         errors = []
 
-        # Check total slots match number of talks
+        # Check there is a slot for every talk
         total_slots = self.total_talk_slots()
         num_talks = len(self.talks)
-        if total_slots != num_talks:
+        if num_talks > total_slots:
             errors.append(
-                f"Slot count mismatch: {total_slots} slots available, "
-                f"but {num_talks} talks provided. "
-                f"Extra slots will be filled with placeholders automatically."
+                f"Too many talks: {num_talks} talks but sessions.csv only "
+                f"provides {total_slots} slots. Add rooms, talks per room, or "
+                f"session rows to sessions.csv."
             )
 
         # Check timeslot counts match block type counts
@@ -160,7 +182,7 @@ def load_from_csv_dir(
     Load conference data from the standardized CSV format.
 
     This is the canonical data loader. It expects a directory with:
-        talks.csv        (required): talk_id, presenter_id, keywords
+        talks.csv        (required): talk_id, presenter_id, keywords (optional)
         preferences.csv  (required): participant_id, talk_id
         sessions.csv     (required): session_id, n_rooms, n_talks_per_room
         availability.csv (optional): presenter_id, unavailable_timeslot
@@ -180,12 +202,18 @@ def load_from_csv_dir(
 
     # --- talks ---
     talks_df = pd.read_csv(data_path / "talks.csv")
-    talks_df = talks_df.rename(columns={"keywords": "track"})
     talks_df["talk_id"] = talks_df["talk_id"].apply(lambda x: f"T{int(x):03d}")
     talks_df["presenter_id"] = talks_df["presenter_id"].apply(
         lambda x: f"P{int(x):03d}")
-    talks_df["title"] = talks_df["talk_id"]
-    talks_df["track"] = talks_df["track"].fillna("General")
+    # title is optional; default to the talk ID
+    if "title" in talks_df.columns:
+        talks_df["title"] = talks_df["title"].fillna(talks_df["talk_id"])
+    else:
+        talks_df["title"] = talks_df["talk_id"]
+    # keywords is optional; normalize to a (possibly empty) string column
+    if "keywords" not in talks_df.columns:
+        talks_df["keywords"] = ""
+    talks_df["keywords"] = talks_df["keywords"].fillna("").astype(str)
     if verbose:
         print(f"  Loaded {len(talks_df)} talks")
 
@@ -223,6 +251,16 @@ def load_from_csv_dir(
             }
         if verbose:
             print(f"  Loaded {len(block_types)} sessions from sessions.csv")
+    else:
+        # Override from the config file: expand entries with count > 1 into
+        # separate timeslots named "<type>_1", "<type>_2", ...
+        expanded = {}
+        for name, bt in block_types.items():
+            count = int(bt.get("count", 1))
+            for i in range(count):
+                block_name = name if count == 1 else f"{name}_{i + 1}"
+                expanded[block_name] = {"n": int(bt["n"]), "k": int(bt["k"]), "count": 1}
+        block_types = expanded
 
     max_rooms = max(bt["n"] for bt in block_types.values())
     room_list = [f"Room_{i + 1}" for i in range(max_rooms)]

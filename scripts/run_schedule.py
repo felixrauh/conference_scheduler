@@ -6,12 +6,14 @@ Single entry point for all scheduling pipelines.
 Configuration can be provided via config file and/or CLI arguments.
 
 Usage:
-    # Quick start with defaults (traditional pipeline, example data)
+    # Quick start without Gurobi (heuristic pipeline)
+    python scripts/run_schedule.py --pipeline heuristic --data-dir examples/orbel2026
+
+    # Default pipeline (traditional, requires Gurobi)
     python scripts/run_schedule.py --data-dir examples/orbel2026
 
-    # Specify pipeline
+    # Other pipelines
     python scripts/run_schedule.py --pipeline matching --data-dir examples/orbel2026
-    python scripts/run_schedule.py --pipeline heuristic --data-dir examples/orbel2026
 
     # Use config file (overrides defaults, CLI overrides config)
     python scripts/run_schedule.py --config config/scheduling_config.jsonc
@@ -24,13 +26,14 @@ Usage:
         --verbose
 
 Pipelines:
-    traditional  - 3-phase optimization (Phase 1 → 2 → 3), requires Gurobi
-    heuristic    - Greedy alternative, no Gurobi needed
-    matching     - Bottom-up matching (Phase A → B → C → D → 3), requires Gurobi
+    traditional          - Phase 1 → 2 → 3 optimization, requires Gurobi
+    heuristic            - Greedy alternative, no Gurobi needed
+    matching             - Bottom-up matching (Phase A → B → C → D → 3), requires Gurobi
+    matching_constrained - Matching with group/keyword constraints, requires Gurobi
 
 Input Data:
     Expects a directory with: talks.csv, preferences.csv, sessions.csv
-    See examples/orbel2026/ for the expected format.
+    (and optionally availability.csv). See examples/orbel2026/ for the format.
 
 See config/scheduling_config.jsonc for all configuration options.
 """
@@ -38,18 +41,41 @@ See config/scheduling_config.jsonc for all configuration options.
 import sys
 import time
 import json
+import random
 import re
 import argparse
+from collections import Counter
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+class SchedulerError(Exception):
+    """A problem with the input data or configuration, reported without traceback."""
 
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+# Allowed values for the algorithm choices (validated before running)
+VALID_CHOICES = {
+    "pipeline": ["traditional", "heuristic", "matching", "matching_constrained"],
+    "phase1_method": ["column_generation", "explicit"],
+    "phase1_pricing_strategy": ["auto", "enumeration", "greedy",
+                                "local_search", "beam_search"],
+    "phase2_partition_strategy": ["greedy", "matching", "random"],
+    "phase2_ordering_strategy": ["enumerate", "greedy"],
+    "phase3_method": ["milp", "hungarian"],
+}
+
+KNOWN_CONFIG_SECTIONS = {
+    "pipeline", "seed", "input", "output", "block_types", "phase1", "phase2",
+    "phase3", "phase4", "rooms", "swap_optimization", "matching_pipeline",
+}
+
 
 @dataclass
 class SchedulerConfig:
@@ -63,6 +89,10 @@ class SchedulerConfig:
     # Output configuration
     output_file: str = "output/schedule.csv"
     verbose: bool = False
+
+    # Seed for the randomized steps (local search, sampling); same input and
+    # seed give the same schedule
+    seed: int = 0
 
     # Block types (None = auto-detect from data)
     block_types: Optional[Dict] = None
@@ -112,8 +142,15 @@ class SchedulerConfig:
         """Create config from dictionary (e.g., parsed JSON)."""
         config = cls()
 
+        unknown = sorted(set(d) - KNOWN_CONFIG_SECTIONS)
+        if unknown:
+            print(f"Warning: ignoring unknown config section(s): {', '.join(unknown)}")
+
         if 'pipeline' in d:
             config.pipeline = d['pipeline']
+
+        if 'seed' in d:
+            config.seed = d['seed']
 
         if 'input' in d:
             inp = d['input']
@@ -121,9 +158,9 @@ class SchedulerConfig:
 
         if 'output' in d:
             out = d['output']
-            if 'schedule_csv' in out:
+            if 'schedule_csv' in out or 'dir' in out:
                 config.output_file = str(
-                    Path(out.get('dir', 'output')) / out['schedule_csv'])
+                    Path(out.get('dir', 'output')) / out.get('schedule_csv', 'schedule.csv'))
 
         if 'block_types' in d and d['block_types'] != "auto":
             config.block_types = d['block_types']
@@ -192,30 +229,95 @@ class SchedulerConfig:
                 )
                 if total_time > 0:
                     config.matching_time_limit = total_time
+            config.require_common_keyword = mp.get(
+                'require_common_keyword', config.require_common_keyword)
+            config.max_keyword_violations = mp.get(
+                'max_keyword_violations', config.max_keyword_violations)
 
         return config
+
+    def validate(self) -> List[str]:
+        """Return a list of configuration errors (empty if valid)."""
+        errors = []
+        for attr, choices in VALID_CHOICES.items():
+            value = getattr(self, attr)
+            if value not in choices:
+                errors.append(
+                    f"Invalid {attr} '{value}'. Choose one of: {', '.join(choices)}")
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool):
+            errors.append(f"Invalid seed '{self.seed}'. Use an integer")
+        if self.rooms:
+            for room in self.rooms:
+                if 'id' not in room:
+                    errors.append(f"Room entry {room} has no 'id'")
+        return errors
+
+
+def strip_jsonc(text: str) -> str:
+    """
+    Turn JSONC (JSON with comments and trailing commas) into plain JSON.
+
+    Removes // and /* */ comments and trailing commas, leaving string
+    contents (e.g. "https://..." or "data//dir") untouched.
+    """
+    def scan(src: str, handle_outside):
+        out, i, n, in_string = [], 0, len(src), False
+        while i < n:
+            c = src[i]
+            if in_string:
+                out.append(c)
+                if c == '\\' and i + 1 < n:
+                    out.append(src[i + 1])
+                    i += 2
+                    continue
+                if c == '"':
+                    in_string = False
+                i += 1
+            elif c == '"':
+                in_string = True
+                out.append(c)
+                i += 1
+            else:
+                i = handle_outside(src, i, out)
+        return ''.join(out)
+
+    def drop_comment(src, i, out):
+        if src.startswith('//', i):
+            j = src.find('\n', i)
+            return len(src) if j == -1 else j
+        if src.startswith('/*', i):
+            j = src.find('*/', i + 2)
+            return len(src) if j == -1 else j + 2
+        out.append(src[i])
+        return i + 1
+
+    def drop_trailing_comma(src, i, out):
+        if src[i] == ',':
+            m = re.match(r',\s*[}\]]', src[i:])
+            if m:
+                return i + 1
+        out.append(src[i])
+        return i + 1
+
+    return scan(scan(text, drop_comment), drop_trailing_comma)
 
 
 def load_jsonc(path: str) -> Dict:
     """Load JSONC (JSON with comments) file."""
     with open(path, 'r') as f:
-        content = f.read()
-    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
-    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
-    content = re.sub(r',\s*([}\]])', r'\1', content)
-    return json.loads(content)
+        return json.loads(strip_jsonc(f.read()))
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Unified Conference Scheduler",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  python scripts/run_schedule.py --pipeline heuristic --data-dir examples/orbel2026
   python scripts/run_schedule.py --data-dir examples/orbel2026
-  python scripts/run_schedule.py --pipeline matching --data-dir examples/orbel2026
-  python scripts/run_schedule.py --pipeline heuristic --data-dir examples/orbel2017
+  python scripts/run_schedule.py --pipeline matching --data-dir examples/orbel2017
   python scripts/run_schedule.py --config config/scheduling_config.jsonc
         """
     )
@@ -223,30 +325,38 @@ Examples:
     parser.add_argument("--config", "-c", type=str, default=None,
                         help="Path to configuration file (JSONC format)")
     parser.add_argument("--pipeline", "-p", type=str,
-                        choices=["traditional", "heuristic",
-                                 "matching", "matching_constrained"],
+                        choices=VALID_CHOICES["pipeline"],
                         default=None,
-                        help="Scheduling pipeline to use (default: traditional)")
+                        help="Scheduling pipeline to use (default: traditional, "
+                             "which requires Gurobi; use 'heuristic' without Gurobi)")
     parser.add_argument("--data-dir", "-d", type=str, default=None,
-                        help="Directory containing input CSV files (talks.csv, preferences.csv, sessions.csv)")
+                        help="Directory containing input CSV files (talks.csv, preferences.csv, "
+                             "sessions.csv; default: examples/orbel2026)")
     parser.add_argument("--output", "-o", type=str, default=None,
-                        help="Output CSV file path")
+                        help="Output CSV file path (a .md file is written next to it)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable verbose output")
-    parser.add_argument("--phase1-method", type=str, choices=["explicit", "column_generation"],
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed (default: 0). The same input and seed give "
+                             "the same schedule; other seeds give alternative schedules")
+    parser.add_argument("--phase1-method", type=str, choices=VALID_CHOICES["phase1_method"],
                         default=None, help="Phase 1 method (traditional pipeline only)")
-    parser.add_argument("--phase2-partition", type=str, choices=["greedy", "matching", "random"],
+    parser.add_argument("--phase2-partition", type=str,
+                        choices=VALID_CHOICES["phase2_partition_strategy"],
                         default=None, help="Phase 2 partition strategy (traditional pipeline only)")
-    parser.add_argument("--phase3-method", type=str, choices=["milp", "hungarian"],
-                        default=None, help="Phase 3 method")
+    parser.add_argument("--phase3-method", type=str, choices=VALID_CHOICES["phase3_method"],
+                        default=None, help="Phase 3 method (heuristic always uses hungarian)")
     parser.add_argument("--time-limit", "-t", type=float, default=None,
-                        help="Overall time limit in seconds")
+                        help="Time limit in seconds for Phase 1 (traditional, heuristic) "
+                             "or the whole matching pipeline")
     parser.add_argument("--require-keyword", action="store_true",
-                        help="Require common keyword for matching (matching_constrained only)")
+                        help="Only pair talks that share a keyword (matching_constrained only)")
     parser.add_argument("--max-violations", type=int, default=None,
-                        help="Max keyword violations allowed (soft constraint mode, 0 = start with 0 and increment)")
+                        help="Soft keyword constraint: minimize keyword violations, starting "
+                             "with this violation budget and raising it until feasible "
+                             "(0 = as few as possible; matching_constrained only)")
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def build_config(args: argparse.Namespace) -> SchedulerConfig:
@@ -256,8 +366,10 @@ def build_config(args: argparse.Namespace) -> SchedulerConfig:
     if args.config:
         try:
             config = SchedulerConfig.from_dict(load_jsonc(args.config))
-        except Exception as e:
-            print(f"Warning: Could not load config file: {e}")
+        except FileNotFoundError:
+            raise SchedulerError(f"Config file not found: {args.config}")
+        except json.JSONDecodeError as e:
+            raise SchedulerError(f"Could not parse config file {args.config}: {e}")
 
     # CLI overrides
     if args.pipeline:
@@ -268,21 +380,29 @@ def build_config(args: argparse.Namespace) -> SchedulerConfig:
         config.output_file = args.output
     if args.verbose:
         config.verbose = True
+    if args.seed is not None:
+        config.seed = args.seed
     if args.phase1_method:
         config.phase1_method = args.phase1_method
     if args.phase2_partition:
         config.phase2_partition_strategy = args.phase2_partition
     if args.phase3_method:
         config.phase3_method = args.phase3_method
-    if args.time_limit:
+    if args.time_limit is not None:
         config.phase1_time_limit = args.time_limit
         config.matching_time_limit = args.time_limit
-    if hasattr(args, 'require_keyword') and args.require_keyword:
+    if args.require_keyword:
         config.require_common_keyword = True
-    if hasattr(args, 'max_violations') and args.max_violations is not None:
+    if args.max_violations is not None:
         config.max_keyword_violations = args.max_violations
+    if config.max_keyword_violations is not None:
         # Soft constraint implies keyword constraint
         config.require_common_keyword = True
+
+    errors = config.validate()
+    if errors:
+        raise SchedulerError(
+            "Invalid configuration:\n" + "\n".join(f"  - {e}" for e in errors))
 
     return config
 
@@ -301,19 +421,86 @@ def load_data(config: SchedulerConfig):
     )
 
 
-def adjust_block_types(data, n_talks: int, verbose: bool = False):
-    """Verify block types match actual talk count, raise if they don't."""
-    current_slots = sum(bt["n"] * bt["k"] * bt["count"]
-                        for bt in data.block_types.values())
+def apply_fixed_block_sessions(data, fixed_block_sessions: List[Dict]) -> Set[str]:
+    """
+    Reserve one room per fixed block session in its target timeslot.
 
-    if current_slots == n_talks:
-        return
+    The timeslot's room count is reduced by one per fixed session and block
+    types are recomputed, so the pipelines schedule the remaining talks around
+    the fixed sessions. Phase 4 inserts the fixed sessions afterwards.
 
-    raise ValueError(
-        f"sessions.csv defines {current_slots} total talk slots "
-        f"but talks.csv contains {n_talks} talks. "
-        f"Please update sessions.csv so the totals match."
-    )
+    Must be called before build_instance(). Returns the fixed talk IDs.
+    """
+    timeslots_by_id = {ts['id']: ts for ts in data.timeslots}
+    all_talks = set(data.talks['talk_id'])
+    shape = {ts['id']: (data.block_types[ts['type_id']]['n'],
+                        data.block_types[ts['type_id']]['k'])
+             for ts in data.timeslots}
+
+    errors = []
+    fixed_talks: Set[str] = set()
+    rooms_taken: Counter = Counter()
+    for fs in fixed_block_sessions:
+        name = fs.get('name', fs.get('block', '?'))
+        block = fs.get('block')
+        talks = fs.get('talks', [])
+        if block not in timeslots_by_id:
+            errors.append(f"Fixed session '{name}': block '{block}' is not a "
+                          f"session_id in sessions.csv ({', '.join(timeslots_by_id)})")
+            continue
+        if len(talks) > shape[block][1]:
+            errors.append(f"Fixed session '{name}' has {len(talks)} talks but "
+                          f"block {block} only has {shape[block][1]} talks per room")
+        for t in talks:
+            if t not in all_talks:
+                errors.append(f"Fixed session '{name}': unknown talk '{t}' "
+                              f"(talk IDs look like T001)")
+            elif t in fixed_talks:
+                errors.append(f"Fixed session '{name}': talk '{t}' appears in "
+                              f"more than one fixed session")
+        fixed_talks.update(talks)
+        rooms_taken[block] += 1
+
+    for block, n_fixed in rooms_taken.items():
+        if n_fixed >= shape[block][0]:
+            errors.append(f"Block {block} has {shape[block][0]} rooms, all taken "
+                          f"by fixed sessions; at least one room must remain")
+    if errors:
+        raise SchedulerError(
+            "Invalid fixed_block_sessions:\n" + "\n".join(f"  - {e}" for e in errors))
+
+    # Shrink the target timeslots and recompute block types by shape
+    for block, n_fixed in rooms_taken.items():
+        n, k = shape[block]
+        shape[block] = (n - n_fixed, k)
+        ts = timeslots_by_id[block]
+        ts['rooms'] = ts['rooms'][:n - n_fixed]
+        print(f"  → {block}: {n_fixed} room(s) reserved for fixed sessions, "
+              f"{n - n_fixed} rooms left to optimize")
+
+    block_types: Dict[str, Dict] = {}
+    for ts in data.timeslots:
+        n, k = shape[ts['id']]
+        type_id = f"{n}R{k}T"
+        ts['type_id'] = type_id
+        block_types.setdefault(type_id, {"n": n, "k": k, "count": 0})
+        block_types[type_id]["count"] += 1
+    data.block_types = block_types
+
+    return fixed_talks
+
+
+def add_placeholder_talks(instance, n_slots: int, verbose: bool = False) -> int:
+    """Pad instance.talks with placeholder talks until it fills n_slots."""
+    n_missing = n_slots - len(instance.talks)
+    for i in range(n_missing):
+        pid = f"PLACEHOLDER_{i+1}"
+        instance.talks.append(pid)
+        instance.talk_presenter[pid] = pid
+    if n_missing > 0 and verbose:
+        print(f"  Adding {n_missing} placeholder talks "
+              f"({len(instance.talks) - n_missing} talks, {n_slots} slots)")
+    return max(n_missing, 0)
 
 
 # =============================================================================
@@ -327,17 +514,14 @@ def run_pipeline(config: SchedulerConfig, instance, data):
         from src.pipelines.traditional import PipelineConfig as TraditionalConfig
         from src.pipelines.traditional import FixedSequenceConfig
 
-        # Convert fixed_sequences from dict to FixedSequenceConfig objects
         fixed_sequences = None
         if config.fixed_sequences:
-            fixed_sequences = []
-            for fs in config.fixed_sequences:
-                fixed_sequences.append(FixedSequenceConfig(
-                    name=fs.get('name', 'FixedSequence'),
-                    talks=fs['talks'],
-                    target_block_type=fs['target_block_type'],
-                    result_block_type=fs['result_block_type']
-                ))
+            fixed_sequences = [FixedSequenceConfig(
+                name=fs.get('name', 'FixedSequence'),
+                talks=fs['talks'],
+                target_block_type=fs['target_block_type'],
+                result_block_type=fs['result_block_type']
+            ) for fs in config.fixed_sequences]
 
         pipeline_config = TraditionalConfig(
             phase1_method=config.phase1_method,
@@ -357,32 +541,16 @@ def run_pipeline(config: SchedulerConfig, instance, data):
     elif config.pipeline == "heuristic":
         from src.pipelines.heuristic import run_heuristic_pipeline
         from src.pipelines.heuristic import PipelineConfig as HeuristicConfig
-        from src.pipelines.heuristic import FixedSequenceConfig as HeuristicFixedSequenceConfig
-        from src.pipelines.traditional import FixedSequenceConfig as TraditionalFixedSequenceConfig
+        from src.pipelines.heuristic import FixedSequenceConfig
 
-        # Convert fixed_sequences to HeuristicFixedSequenceConfig format
-        # Handle both dict and TraditionalFixedSequenceConfig inputs
-        heuristic_fixed_sequences = None
+        fixed_sequences = None
         if config.fixed_sequences:
-            heuristic_fixed_sequences = []
-            for fs in config.fixed_sequences:
-                if isinstance(fs, dict):
-                    heuristic_fixed_sequences.append(HeuristicFixedSequenceConfig(
-                        name=fs['name'],
-                        talks=fs['talks'],
-                        target_block_type=fs['target_block_type'],
-                        result_block_type=fs['result_block_type']
-                    ))
-                elif isinstance(fs, TraditionalFixedSequenceConfig):
-                    heuristic_fixed_sequences.append(HeuristicFixedSequenceConfig(
-                        name=fs.name,
-                        talks=fs.talks,
-                        target_block_type=fs.target_block_type,
-                        result_block_type=fs.result_block_type
-                    ))
-                else:
-                    # Assume it's already a HeuristicFixedSequenceConfig
-                    heuristic_fixed_sequences.append(fs)
+            fixed_sequences = [FixedSequenceConfig(
+                name=fs.get('name', 'FixedSequence'),
+                talks=fs['talks'],
+                target_block_type=fs['target_block_type'],
+                result_block_type=fs['result_block_type']
+            ) for fs in config.fixed_sequences]
 
         pipeline_config = HeuristicConfig(
             phase1_time_limit=config.phase1_time_limit,
@@ -390,97 +558,71 @@ def run_pipeline(config: SchedulerConfig, instance, data):
             phase2_ordering_strategy=config.phase2_ordering_strategy,
             phase2_local_search_iterations=100,
             verbose=config.verbose,
-            fixed_sequences=heuristic_fixed_sequences
+            fixed_sequences=fixed_sequences
         )
         return run_heuristic_pipeline(pipeline_config, instance, data)
 
-    elif config.pipeline == "matching":
-        from src.matching_pipeline import run_matching_pipeline
-        from src.instance import build_instance
+    elif config.pipeline in ("matching", "matching_constrained"):
+        # The matching pipelines need exactly one talk per slot
+        add_placeholder_talks(
+            instance, data.total_talk_slots(), verbose=config.verbose)
 
-        # Add placeholder talks so talk count matches slot count from sessions.csv
-        # (don't use adjust_block_types — matching pipeline needs original session structure)
-        total_slots = sum(bt["n"] * bt["k"] * bt["count"]
-                          for bt in data.block_types.values())
-        n_real_talks = len(instance.talks)
-        if n_real_talks < total_slots:
-            import pandas as pd
-            n_placeholders = total_slots - n_real_talks
-            if config.verbose:
-                print(
-                    f"  Adding {n_placeholders} placeholder talks ({n_real_talks} talks, {total_slots} slots)")
-            placeholder_rows = []
-            for i in range(n_placeholders):
-                pid = f"PLACEHOLDER_{i+1}"
-                placeholder_rows.append({
-                    "talk_id": pid, "presenter_id": pid,
-                    "title": pid, "track": "Placeholder"
-                })
-            data.talks = pd.concat(
-                [data.talks, pd.DataFrame(placeholder_rows)], ignore_index=True
+        if config.pipeline == "matching":
+            from src.matching_pipeline import run_matching_pipeline
+
+            print("\n[Running Matching Pipeline: A → B → C → D → 3]")
+
+            pipeline_result, phase3_result = run_matching_pipeline(
+                instance,
+                time_limit=config.matching_time_limit,
+                verbose=config.verbose,
+                run_phase3=True,
+                phase3_method=config.phase3_method
             )
-        instance = build_instance(data)
+        else:
+            from src.matching_pipeline_constrained import (
+                run_constrained_matching_pipeline,
+                MatchingConstraints, TalkMetadata
+            )
 
-        print("\n[Running Matching Pipeline: A → B → C → D → 3]")
+            # Build talk metadata for real talks (placeholders have none,
+            # which lets them pair with any talk)
+            talk_keywords = data.talk_keywords()
+            scheduled = set(instance.talks)
+            metadata = {}
+            for _, row in data.talks.iterrows():
+                talk_id = row['talk_id']
+                if talk_id not in scheduled:
+                    continue
+                group = row.get('special_group', 'general')
+                if not isinstance(group, str) or not group.strip():
+                    group = 'general'
+                metadata[talk_id] = TalkMetadata(
+                    talk_id=talk_id, special_group=group.strip(),
+                    keywords=talk_keywords.get(talk_id, set()))
 
-        pipeline_result, phase3_result = run_matching_pipeline(
-            instance,
-            time_limit=config.matching_time_limit,
-            verbose=config.verbose,
-            run_phase3=True,
-            phase3_method=config.phase3_method
-        )
+            if config.require_common_keyword and not talk_keywords:
+                raise SchedulerError(
+                    "Keyword constraint requested, but talks.csv has no keywords")
 
-        return {
-            'phase1_time': pipeline_result.phase_a_time + pipeline_result.phase_b_time,
-            'phase2_time': pipeline_result.phase_c_time + pipeline_result.phase_d_time,
-            'phase3_time': 0,
-            'phase1_objective': pipeline_result.phase_c_cost,
-            'phase2_hopping': -pipeline_result.phase_d_benefit,
-            'phase3_result': phase3_result,
-            'pipeline_result': pipeline_result,
-            'blocks': pipeline_result.ordered_blocks
-        }
+            # Constraints: same group required, common keyword optional
+            constraints = MatchingConstraints(
+                require_same_group=True,
+                require_common_keyword=config.require_common_keyword,
+                max_keyword_violations=config.max_keyword_violations
+            )
 
-    elif config.pipeline == "matching_constrained":
-        from src.matching_pipeline_constrained import (
-            run_constrained_matching_pipeline,
-            MatchingConstraints, TalkMetadata
-        )
-        from src.instance import build_instance
+            print("\n[Running Constrained Matching Pipeline]")
 
-        adjust_block_types(data, len(instance.talks), config.verbose)
-        instance = build_instance(data)
-
-        # Build talk metadata from data
-        metadata = {}
-        for _, row in data.talks.iterrows():
-            talk_id = row['talk_id']
-            kw_str = str(row.get('keywords', ''))
-            keywords = set(kw.strip()
-                           for kw in kw_str.split(';') if kw.strip())
-            group = row.get('special_group', 'general')
-            metadata[talk_id] = TalkMetadata(
-                talk_id=talk_id, special_group=group, keywords=keywords)
-
-        # Constraints: same group required, common keyword optional
-        constraints = MatchingConstraints(
-            require_same_group=True,
-            require_common_keyword=config.require_common_keyword,
-            max_keyword_violations=config.max_keyword_violations
-        )
-
-        print("\n[Running Constrained Matching Pipeline]")
-
-        pipeline_result, phase3_result = run_constrained_matching_pipeline(
-            instance,
-            metadata=metadata,
-            constraints=constraints,
-            time_limit=config.matching_time_limit,
-            verbose=config.verbose,
-            run_phase3=True,
-            phase3_method=config.phase3_method
-        )
+            pipeline_result, phase3_result = run_constrained_matching_pipeline(
+                instance,
+                metadata=metadata,
+                constraints=constraints,
+                time_limit=config.matching_time_limit,
+                verbose=config.verbose,
+                run_phase3=True,
+                phase3_method=config.phase3_method
+            )
 
         return {
             'phase1_time': pipeline_result.phase_a_time + pipeline_result.phase_b_time,
@@ -532,21 +674,8 @@ def run_swap_optimization(results, config: SchedulerConfig, instance, data):
             print("\n[Swap Optimization] No violations to resolve — skipping")
         return results
 
-    # Load talk keywords for coherence scoring (optional)
-    talk_keywords = None
-    try:
-        keywords_col = 'keywords'
-        if keywords_col in data.talks.columns:
-            talk_keywords = {}
-            for _, row in data.talks.iterrows():
-                tid = row['talk_id']
-                kw_str = str(row.get(keywords_col, ''))
-                keywords = set(kw.strip()
-                               for kw in kw_str.split(';') if kw.strip())
-                if keywords:
-                    talk_keywords[tid] = keywords
-    except Exception:
-        pass
+    # Talk keywords for coherence scoring (optional)
+    talk_keywords = data.talk_keywords() or None
 
     print("\n[Swap Optimization]")
     swap_result = optimize_presenter_violations(
@@ -583,8 +712,6 @@ def run_phase4(results, config: SchedulerConfig, instance, data):
     2. Assigns rooms based on audience size
     3. Adds fixed block sessions
     """
-    import time
-    from pathlib import Path
     from src.phase4 import (
         solve_phase4, Phase4Input, FixedBlockSession
     )
@@ -597,20 +724,21 @@ def run_phase4(results, config: SchedulerConfig, instance, data):
 
     start_time = time.time()
 
-    # Load talk metadata from Abstracts.xlsx
+    # Basic metadata from talks.csv (optional title / presenter_name / authors)
+    talk_metadata = {}
+    for _, row in data.talks.iterrows():
+        talk_id = row['talk_id']
+        talk_metadata[talk_id] = {
+            'title': _str_or_empty(row.get('title')) or talk_id,
+            'primary_contact_author': (_str_or_empty(row.get('presenter_name'))
+                                       or row.get('presenter_id', '')),
+            'author_names': _str_or_empty(row.get('authors')),
+        }
+
+    # Richer metadata from an Abstracts.xlsx export, if present
     abstracts_path = Path(config.data_dir) / "Abstracts.xlsx"
     if abstracts_path.exists():
-        talk_metadata = load_talk_metadata_from_abstracts(abstracts_path)
-    else:
-        # Fall back to basic metadata from data.talks
-        talk_metadata = {}
-        for _, row in data.talks.iterrows():
-            talk_id = row['talk_id']
-            talk_metadata[talk_id] = {
-                'title': row.get('title', ''),
-                'primary_contact_author': row.get('presenter_id', ''),
-                'author_names': '',
-            }
+        talk_metadata.update(load_talk_metadata_from_abstracts(abstracts_path))
 
     # Parse fixed block sessions from config
     fixed_block_sessions = []
@@ -650,11 +778,12 @@ def run_phase4(results, config: SchedulerConfig, instance, data):
         fixed_block_sessions=fixed_block_sessions
     )
 
-    # Run Phase 4
+    # Run Phase 4 (output follows the session order of sessions.csv)
     phase4_result = solve_phase4(
         phase4_input,
         room_names=room_names,
-        verbose=config.phase4_verbose
+        verbose=config.phase4_verbose,
+        timeslot_order=[ts['id'] for ts in data.timeslots]
     )
 
     phase4_time = time.time() - start_time
@@ -662,6 +791,13 @@ def run_phase4(results, config: SchedulerConfig, instance, data):
     results['phase4_time'] = phase4_time
 
     return phase4_result
+
+
+def _str_or_empty(value) -> str:
+    """Return value as a stripped string, or '' for None/NaN."""
+    if value is None or (isinstance(value, float) and value != value):
+        return ''
+    return str(value).strip()
 
 
 # =============================================================================
@@ -708,11 +844,6 @@ def export_schedule(results, config: SchedulerConfig, instance, data):
         for _, row in data.talks.iterrows()
     }
 
-    # Build presenter names from talks (presenter_id is the name in anonymized data)
-    presenter_names = {}
-    for _, row in data.talks.iterrows():
-        presenter_names[row['presenter_id']] = row['presenter_id']
-
     rows = []
     for assignment in phase3_result.assignments:
         block = assignment.block
@@ -724,11 +855,11 @@ def export_schedule(results, config: SchedulerConfig, instance, data):
 
         for slot_idx, ntuple in enumerate(block.tuples):
             for room_pos, talk_id in enumerate(ntuple):
-                room_id = room_mapping.get(room_pos, f"Room_{room_pos}")
+                room_id = room_mapping.get(room_pos, f"Room_{room_pos + 1}")
                 info = talk_info.get(talk_id, {})
                 presenter_id = info.get('presenter_id', '')
                 # Extract paper_id from talk_id (T001 -> 1)
-                paper_id = int(talk_id[1:]) if talk_id.startswith('T') else 0
+                paper_id = int(talk_id[1:]) if re.fullmatch(r'T\d+', talk_id) else 0
 
                 rows.append({
                     'Session_ID': ts_id,
@@ -739,7 +870,6 @@ def export_schedule(results, config: SchedulerConfig, instance, data):
                     'Paper_ID': paper_id,
                     'Title': info.get('title', ''),
                     'Presenter_ID': presenter_id,
-                    'Presenter_Name': presenter_names.get(presenter_id, presenter_id)
                 })
 
     df = pd.DataFrame(rows)
@@ -767,17 +897,7 @@ def run_evaluation(results, config: SchedulerConfig, instance, data):
     if 'Room' not in schedule_df.columns and 'Room_ID' in schedule_df.columns:
         schedule_df['Room'] = schedule_df['Room_ID']
 
-    # Build talk keywords for coherence metric
-    talk_keywords = {}
-    if 'keywords' in data.talks.columns:
-        for _, row in data.talks.iterrows():
-            tid = row['talk_id']
-            kw_str = str(row.get('keywords', ''))
-            keywords = set(kw.strip() for kw in kw_str.split(';') if kw.strip())
-            if keywords:
-                talk_keywords[tid] = keywords
-
-    return evaluate_from_instance(schedule_df, instance, talk_keywords)
+    return evaluate_from_instance(schedule_df, instance, data.talk_keywords())
 
 
 def print_summary(results, config: SchedulerConfig, total_time: float,
@@ -818,9 +938,17 @@ def print_summary(results, config: SchedulerConfig, total_time: float,
 # MAIN
 # =============================================================================
 
-def main():
-    args = parse_args()
-    config = build_config(args)
+def run_scheduler(config: SchedulerConfig) -> Dict:
+    """
+    Run the full scheduling workflow for a configuration.
+
+    Loads data, runs the selected pipeline, swap optimization and Phase 4,
+    exports the schedule and evaluates it. Returns the results dict, with the
+    evaluator metrics under 'evaluation' and the wall time under 'total_time'.
+
+    Raises SchedulerError for problems with the input data or configuration.
+    """
+    from src.instance import build_instance
 
     print("=" * 70)
     print(f"CONFERENCE SCHEDULER - {config.pipeline.upper()} PIPELINE")
@@ -829,8 +957,11 @@ def main():
     print(f"  Pipeline:    {config.pipeline}")
     print(f"  Data dir:    {config.data_dir}")
     print(f"  Output:      {config.output_file}")
-    if args.config:
-        print(f"  Config file: {args.config}")
+    print(f"  Seed:        {config.seed}")
+
+    # Fix the randomized steps so that the same input and seed give the same
+    # schedule (all of them use Python's global random generator)
+    random.seed(config.seed)
 
     start_total = time.time()
 
@@ -839,149 +970,40 @@ def main():
     try:
         data = load_data(config)
     except Exception as e:
-        print(f"Error loading data: {e}")
-        sys.exit(1)
+        raise SchedulerError(f"Error loading data from {config.data_dir}: {e}")
 
-    errors = data.validate() if hasattr(data, 'validate') else []
+    errors = data.validate()
     if errors:
         print("Validation warnings:")
         for err in errors:
             print(f"  - {err}")
 
-    # Build instance
-    from src.instance import build_instance
+    n_talks, n_slots = len(data.talks), data.total_talk_slots()
+    if n_talks > n_slots:
+        raise SchedulerError(
+            f"{n_talks} talks but only {n_slots} slots in sessions.csv. "
+            f"Add rooms, talks per room, or sessions so every talk fits.")
+
+    # Reserve rooms for fixed block sessions before building the instance
+    fixed_talk_ids: Set[str] = set()
+    if config.fixed_block_sessions:
+        print(f"\n[Fixed Block Sessions] {len(config.fixed_block_sessions)} configured")
+        fixed_talk_ids = apply_fixed_block_sessions(
+            data, config.fixed_block_sessions)
+
     instance = build_instance(data)
+    if fixed_talk_ids:
+        instance.talks = [t for t in instance.talks if t not in fixed_talk_ids]
+        print(f"✓ Excluded {len(fixed_talk_ids)} fixed_block_session talks from optimization")
 
     print(f"✓ Loaded {len(instance.talks)} talks")
     print(f"✓ {sum(len(p) for p in instance.preferences.values())} preferences from {len(instance.participants)} participants")
-
-    # Exclude fixed_block_sessions talks from optimization and adjust block types
-    if config.fixed_block_sessions:
-        fixed_talk_ids = set()
-        for fs in config.fixed_block_sessions:
-            fixed_talk_ids.update(fs['talks'])
-
-        if fixed_talk_ids:
-            # Remove fixed talks from instance
-            original_count = len(instance.talks)
-            instance.talks = [
-                t for t in instance.talks if t not in fixed_talk_ids]
-            excluded_count = original_count - len(instance.talks)
-            print(
-                f"✓ Excluded {excluded_count} fixed_block_session talks from optimization")
-
-            # Adjust block types: reduce one room per fixed_block_session
-            # Each fixed_block_session takes one room slot from the target block's timeslot
-            # We need to find which block type corresponds to each timeslot and reduce n by 1
-            from src.pipelines.traditional import FixedSequenceConfig
-
-            # Build timeslot -> block_type mapping from data.timeslots
-            timeslot_block_types = {}
-            for ts in data.timeslots:
-                ts_id = ts.get('id', ts) if isinstance(ts, dict) else str(ts)
-                type_id = ts.get('type_id', None)
-                timeslot_block_types[ts_id] = type_id
-
-            # For fixed_block_sessions, we have two approaches:
-            #
-            # Approach A (traditional pipeline): Convert to fixed_sequences for Phase 2 attachment
-            #   - Phase 2 attaches fixed sequences to blocks (expanding them)
-            #   - Phase 3 assigns blocks to timeslots (needs timeslot types unchanged)
-            #   - Problem: Phase 3 doesn't know WHICH block goes to WHICH timeslot
-            #
-            # Approach B (heuristic pipeline with fixed_block_sessions): Let Phase 4 handle it
-            #   - Update timeslot types to reduced sizes (e.g., FA: 4R4T → 3R4T)
-            #   - Phase 1-3 create/assign blocks with reduced sizes
-            #   - Phase 4 adds fixed sessions to the correct timeslots
-            #
-            # We use Approach B for the heuristic pipeline when fixed_block_sessions are specified
-
-            if config.pipeline == "heuristic":
-                # Approach B: Update timeslot type_ids for Phase 3 matching
-                # Phase 4 will add the fixed sessions to the correct timeslots
-                for fs in config.fixed_block_sessions:
-                    block_id = fs['block']
-                    name = fs.get('name', block_id)
-                    result_block_type = timeslot_block_types.get(block_id)
-                    if result_block_type:
-                        import re
-                        match = re.match(r'(\d+)R(\d+)T', result_block_type)
-                        if match:
-                            n, k = int(match.group(1)), int(match.group(2))
-                            target_block_type = f"{n-1}R{k}T"
-
-                            # Update timeslot type_id to the reduced type
-                            for ts in data.timeslots:
-                                ts_id_check = ts.get('id', ts) if isinstance(
-                                    ts, dict) else str(ts)
-                                if ts_id_check == block_id and isinstance(ts, dict):
-                                    ts['type_id'] = target_block_type
-                                    # Also update rooms list if present
-                                    if 'rooms' in ts and len(ts['rooms']) > n - 1:
-                                        ts['rooms'] = ts['rooms'][:n-1]
-                                    break
-
-                            # Also update instance.block_types for the heuristic pipeline
-                            # Decrease count of result_block_type, increase count of target_block_type
-                            if result_block_type in instance.block_types:
-                                instance.block_types[result_block_type]['count'] -= 1
-                                if instance.block_types[result_block_type]['count'] <= 0:
-                                    del instance.block_types[result_block_type]
-
-                            if target_block_type not in instance.block_types:
-                                instance.block_types[target_block_type] = {
-                                    'n': n-1, 'k': k, 'count': 1}
-                            else:
-                                instance.block_types[target_block_type]['count'] += 1
-
-                            print(
-                                f"  → {name}: timeslot {block_id} reduced to {target_block_type} (Phase 4 will add fixed session)")
-
-                # Don't create fixed_sequences for heuristic pipeline
-                # Phase 4 will handle fixed_block_sessions directly
-            else:
-                # Approach A: Convert to fixed_sequences for traditional pipeline
-                auto_fixed_sequences = []
-                for fs in config.fixed_block_sessions:
-                    block_id = fs['block']
-                    talks = fs['talks']
-                    name = fs.get('name', block_id)
-
-                    result_block_type = timeslot_block_types.get(block_id)
-                    if result_block_type:
-                        import re
-                        match = re.match(r'(\d+)R(\d+)T', result_block_type)
-                        if match:
-                            n, k = int(match.group(1)), int(match.group(2))
-                            target_block_type = f"{n-1}R{k}T"
-
-                            auto_fixed_sequences.append(FixedSequenceConfig(
-                                name=name,
-                                talks=talks,
-                                target_block_type=target_block_type,
-                                result_block_type=result_block_type
-                            ))
-                            print(
-                                f"  → {name}: auto-configured as {target_block_type} → {result_block_type}")
-
-                if auto_fixed_sequences:
-                    if config.fixed_sequences is None:
-                        config.fixed_sequences = []
-                    config.fixed_sequences.extend(auto_fixed_sequences)
+    n_empty = data.total_talk_slots() - len(instance.talks)
+    if n_empty > 0:
+        print(f"✓ {data.total_talk_slots()} slots: {n_empty} will be filled with placeholder talks")
 
     # Run pipeline
-    try:
-        results = run_pipeline(config, instance, data)
-    except ImportError as e:
-        if "gurobipy" in str(e) and config.pipeline != "heuristic":
-            print(f"\n❌ Gurobi not available. Use --pipeline heuristic instead.")
-            sys.exit(1)
-        raise
-    except Exception as e:
-        print(f"\n❌ Pipeline failed: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    results = run_pipeline(config, instance, data)
 
     # Run swap optimization (between Phase 3 and Phase 4)
     if config.swap_enabled and results.get('phase3_result'):
@@ -997,8 +1019,9 @@ def main():
         run_phase4(results, config, instance, data)
     except Exception as e:
         print(f"\n⚠️ Phase 4 failed: {e}")
-        import traceback
-        traceback.print_exc()
+        if config.verbose:
+            import traceback
+            traceback.print_exc()
         # Continue without Phase 4 - export_schedule will fall back
 
     # Export and summarize
@@ -1011,14 +1034,48 @@ def main():
     try:
         eval_metrics = run_evaluation(results, config, instance, data)
     except Exception as e:
-        if config.verbose:
-            print(f"\n⚠️ Evaluation failed: {e}")
+        print(f"\n⚠️ Evaluation failed: {e}")
 
     print_summary(results, config, total_time, eval_metrics)
 
     print("\n" + "=" * 70)
     print(f"✓ Done! Schedule saved to {config.output_file}")
     print("=" * 70)
+
+    results['evaluation'] = eval_metrics
+    results['total_time'] = total_time
+    return results
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    config = SchedulerConfig(pipeline=args.pipeline or "traditional")
+
+    try:
+        config = build_config(args)
+        if args.config:
+            print(f"Config file: {args.config}")
+        run_scheduler(config)
+    except SchedulerError as e:
+        print(f"\n❌ {e}")
+        return 1
+    except ImportError as e:
+        if "gurobipy" in str(e):
+            print(f"\n❌ Gurobi (gurobipy) is not installed, but the "
+                  f"'{config.pipeline}' pipeline needs it.\n"
+                  f"   Use --pipeline heuristic, or install Gurobi: pip install gurobipy")
+            return 1
+        raise
+    except Exception as e:
+        print(f"\n❌ Pipeline failed: {e}")
+        if "license" in str(e).lower():
+            print("   This looks like a Gurobi license problem. The pip-installed "
+                  "gurobipy only includes a size-limited license, which is too small "
+                  "for most conferences. Get a full (e.g. free academic) license from "
+                  "https://www.gurobi.com/, or use --pipeline heuristic.")
+        import traceback
+        traceback.print_exc()
+        return 1
 
     return 0
 

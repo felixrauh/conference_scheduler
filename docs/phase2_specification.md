@@ -1,375 +1,171 @@
-# Phase 2: Minimize Session Hopping
+# Phase 2: Minimize Room Hopping
 
 ## Problem Statement
 
-Given the selected n-tuples from Phase 1, determine how to **assemble them into blocks** to minimize "session hopping."
+Given the tuples of parallel talks selected in Phase 1, **assemble them into blocks** and **order them within each block** so that participants need to switch rooms as little as possible.
 
-A **block** consists of $k$ consecutive n-tuples (timeslots within a session). A participant "hops" when they attend non-consecutive talks within a session (e.g., talk 1 and talk 3, but not talk 2).
+A **block** consists of $k$ consecutive tuples (the $k$ talk slots of a session block). Position $r$ of every tuple in a block is the same room, so a room-session is the sequence of talks at position $r$. A participant **hops** when they have to change rooms between consecutive talks they want to attend.
 
----
-
-## Background from Paper
-
-### Definition: Hopping Number
-
-For a participant $p$ and a block $B = (e_1, e_2, \ldots, e_k)$ of $k$ consecutive tuples:
-
-The **hopping number** $h(p, B)$ is computed as follows:
-1. Let $a_j = 1$ if participant $p$ attends a talk in tuple $e_j$, else $a_j = 0$
-2. Find the first and last attended tuples: $\text{first} = \min\{j : a_j = 1\}$, $\text{last} = \max\{j : a_j = 1\}$
-3. Count the gaps: $h(p, B) = \sum_{j=\text{first}}^{\text{last}} (1 - a_j)$
-
-**Example:** If $(a_1, a_2, a_3, a_4) = (1, 0, 1, 1)$, then first=1, last=4, and hopping = 1 (the gap at position 2).
-
-### Total Hopping for a Block
-
-$$H(B) = \sum_{p \in P} h(p, B)$$
-
-### Dynamic Programming for Block Cost
-
-For a given set of $k$ tuples $\{e_1, \ldots, e_k\}$ (unordered), the optimal ordering that minimizes hopping can be computed in $O(k! \cdot |P|)$ by trying all permutations.
-
-However, the paper uses a DP formulation. For each participant, define:
-
-$$f(j, s) = \text{minimum hopping to schedule first } j \text{ tuples ending in state } s$$
-
-where state $s \in \{\text{not-started}, \text{in-session}, \text{finished}\}$.
+Phase 2 is used by the `traditional` and `heuristic` pipelines. The matching pipelines order talks in their own Phase D (see [matching_pipeline_specification.md](matching_pipeline_specification.md)).
 
 ---
 
-## Input from Phase 1
+## Hopping
 
-Phase 1 returns a list of selected n-tuples:
+### Definition (as implemented)
 
-```python
-Phase1Result = List[Tuple[str, ...]]
-# Example: [('T001', 'T002', 'T010', 'T012'), ('T004', 'T005', 'T007', 'T011'), ...]
-```
+For a participant $p$ and an ordered block $B = (e_1, \ldots, e_k)$, let $R_j \subseteq \{1, \ldots, n\}$ be the rooms in which tuple $e_j$ contains a talk that $p$ wants to attend. The participant attends one preferred talk in every tuple where $R_j \neq \emptyset$ and stays put elsewhere. The **hopping number** $h(p, B)$ is the minimum number of room changes over all such choices:
 
-All tuples have the same size $n$ (number of parallel rooms).
+$$h(p, B) = \min_{\rho_j \in R_j} \; \bigl|\{\, j : \rho_j \neq \rho_{j'} \,\}\bigr|$$
 
----
+where $j'$ is the previous tuple with $R_{j'} \neq \emptyset$. It is computed with a small dynamic program over rooms (`compute_participant_hopping` in `src/phase2.py`). Participants with preferred talks in at most one tuple of the block never hop.
 
-## Phase 2 Problem
+**Example:** Preferred rooms $(R_1, R_2, R_3, R_4) = (\{1\}, \emptyset, \{2, 3\}, \{3\})$ give $h = 1$: stay in room 1, skip slot 2, then go to room 3 for slots 3 and 4.
 
-### Given
-- Selected tuples $E = \{e_1, e_2, \ldots, e_m\}$ from Phase 1
-- Block types $\mathcal{B}$ with parameters $(n_\beta, k_\beta, r_\beta)$
-- Participant preferences
+The total hopping of a block is $H(B) = \sum_{p \in P} h(p, B)$. The same definition is used by the evaluator's "session hops" metric.
 
-### Find
-- Partition of tuples into blocks
-- Ordering of tuples within each block
+> **Note:** This counts room switches. The paper's hopping number may be defined differently (see the README's Known Limitations on possible discrepancies with the paper).
 
-### Minimize
-Total hopping across all blocks and participants:
-$$\min \sum_{B \in \text{Blocks}} H(B)$$
+### Ordering within a Block
+
+$H(B)$ depends on the order of the tuples. Two strategies are available (`phase2.ordering_strategy`):
+
+| Strategy | Method | Complexity |
+|----------|--------|------------|
+| `enumerate` (default) | Try all $k!$ orders, keep the best | $O(k! \cdot k \cdot n^2 \cdot \lvert P\rvert)$ — optimal; fine for $k \le 5$ |
+| `greedy` | Build the order position by position, adding the tuple with the smallest hopping increase | Faster, for larger $k$ |
 
 ---
 
-## Extended Formulation (Variable $k$)
-
-### Challenge
-
-In our setup, different block types have different $k$ values:
-- Block type `4R3T`: $k = 3$ (3 talks per session → 3 tuples per block)
-- Block type `4R4T`: $k = 4$ (4 talks per session → 4 tuples per block)
-
-We have 20 tuples total and need to partition them into:
-- 4 blocks of size 3 (from `4R3T`: 4 blocks × 3 = 12 tuples)
-- 2 blocks of size 4 (from `4R4T`: 2 blocks × 4 = 8 tuples)
-- Total: 12 + 8 = 20 tuples ✓
-
-### Key Insight
-
-Since all tuples have the same $n$ (from Phase 1), we need to decide:
-1. **Which tuples go into which block type** (size-3 vs size-4 blocks)
-2. **How to order tuples within each block** to minimize hopping
-
----
-
-## Mathematical Formulation
-
-### Sets
-
-- $E$: Set of selected tuples from Phase 1 (all of size $n$)
-- $\mathcal{K}$: Set of block sizes needed, with multiplicity
-  - Derived from block types: $\{(k_1, c_1), (k_2, c_2), \ldots\}$ where $c_i$ = count of blocks of size $k_i$
-- $P$: Set of participants
-
-### Parameters
-
-- $h(e_1, e_2, \ldots, e_k)$: Hopping cost for a block with tuples in given order
-  - Computed by evaluating all permutations or using DP
-
-### Decision
-
-Partition $E$ into blocks and order tuples within each block.
-
-### Approaches
-
-#### Approach A: Two-Stage
-
-1. **Stage 1: Partition tuples into block-size groups**
-   - Assign each tuple to a "slot" in some block
-   - This is a set partitioning / assignment problem
-
-2. **Stage 2: Order tuples within each block**
-   - For each block, find optimal permutation minimizing hopping
-   - Can be done by enumeration for small $k$
-
-#### Approach B: Direct IP Formulation
-
-**Decision Variables:**
-- $y_{e,b,j} \in \{0,1\}$: 1 if tuple $e$ is assigned to block $b$ at position $j$
-
-**Constraints:**
-1. Each tuple assigned to exactly one (block, position):
-$$\sum_{b} \sum_{j=1}^{k_b} y_{e,b,j} = 1 \quad \forall e \in E$$
-
-2. Each (block, position) has exactly one tuple:
-$$\sum_{e \in E} y_{e,b,j} = 1 \quad \forall b, j$$
-
-**Objective:**
-Minimize total hopping (requires linearization of the hopping function).
-
-#### Approach C: Heuristic (Greedy Assembly)
-
-1. Compute pairwise "compatibility" between tuples based on hopping reduction
-2. Greedily assemble blocks by picking compatible tuples
-3. Order tuples within each block optimally
-
----
-
-## Data Structures
-
-### Input
+## Input and Output
 
 ```python
 @dataclass
 class Phase2Input:
-    """Input to Phase 2."""
-    
-    # Selected tuples from Phase 1
-    tuples: List[Tuple[str, ...]]
-    
-    # Block sizes needed: [(k, count), ...]
-    # e.g., [(3, 4), (4, 2)] means 4 blocks of size 3 and 2 blocks of size 4
-    block_sizes: List[Tuple[int, int]]
-    
+    # Tuples from Phase 1, grouped by tuple size n: {n: [tuples of size n]}
+    tuples_by_n: Dict[int, List[Tuple[str, ...]]]
+
+    # Block specifications: [(n, k, count, block_type), ...]
+    # e.g. [(5, 4, 4, "5R4T"), (5, 3, 1, "5R3T"), (4, 3, 1, "4R3T")]
+    block_specs: List[Tuple[int, int, int, str]]
+
     # Participant preferences: {participant_id: set of talk_ids}
     preferences: Dict[str, Set[str]]
-```
 
-### Output
+    # Optional pre-specified sequences (see "Fixed Sequences" below)
+    fixed_sequences: Optional[List[FixedSequence]] = None
 
-```python
+
 @dataclass
 class Block:
-    """A block of k ordered tuples."""
-    
-    block_id: str
-    block_type: str  # e.g., '4R3T'
-    tuples: List[Tuple[str, ...]]  # Ordered list of tuples
+    block_id: str                   # "B01", "B02", ...
+    block_type: str                 # e.g. "5R4T"; Phase 3 matches it to timeslot types
+    tuples: List[Tuple[str, ...]]   # Ordered: tuples[j][r] is the talk in slot j, room r
     hopping_cost: int
+
 
 @dataclass
 class Phase2Result:
-    """Output from Phase 2."""
-    
     blocks: List[Block]
     total_hopping: int
 ```
 
----
-
-## Hopping Computation
-
-### Per-Participant Hopping for a Block
-
-```python
-def compute_participant_hopping(
-    block_tuples: List[Tuple[str, ...]],
-    participant_prefs: Set[str]
-) -> int:
-    """
-    Compute hopping for one participant in a block.
-    
-    Args:
-        block_tuples: Ordered list of tuples in the block
-        participant_prefs: Set of talk_ids this participant wants to attend
-    
-    Returns:
-        Number of "hops" (gaps between attended tuples)
-    """
-    # For each tuple position, check if participant attends any talk
-    attendance = []
-    for ntuple in block_tuples:
-        attends = any(talk_id in participant_prefs for talk_id in ntuple)
-        attendance.append(1 if attends else 0)
-    
-    # Find first and last attendance
-    if sum(attendance) <= 1:
-        return 0  # No hopping possible with 0 or 1 attended
-    
-    first = attendance.index(1)
-    last = len(attendance) - 1 - attendance[::-1].index(1)
-    
-    # Count gaps
-    hopping = sum(1 - attendance[j] for j in range(first, last + 1))
-    return hopping
-```
-
-### Total Block Hopping
-
-```python
-def compute_block_hopping(
-    block_tuples: List[Tuple[str, ...]],
-    preferences: Dict[str, Set[str]]
-) -> int:
-    """Compute total hopping for a block across all participants."""
-    total = 0
-    for p_id, prefs in preferences.items():
-        total += compute_participant_hopping(block_tuples, prefs)
-    return total
-```
+Tuples of size $n$ can only go into blocks with $n$ rooms.
 
 ---
 
-## Design Decisions
+## Algorithm
 
-### Q1: How to partition tuples into different block sizes?
+`solve_phase2()` in `src/phase2.py` runs these steps:
 
-**Decision:** Start with **heuristic** (greedy by compatibility), but design with a clean interface so it can be **replaced by an IP-based approach** later.
-
-**Implementation:**
-```python
-def partition_tuples_into_blocks(
-    tuples: List[Tuple[str, ...]],
-    block_sizes: List[Tuple[int, int]],  # [(k, count), ...]
-    preferences: Dict[str, Set[str]],
-    strategy: str = "greedy"  # "greedy" | "ip" | "random"
-) -> List[List[Tuple[str, ...]]]:
-    """
-    Partition tuples into groups for each block.
-    Returns list of unordered tuple groups, one per block.
-    """
-    if strategy == "greedy":
-        return _partition_greedy(tuples, block_sizes, preferences)
-    elif strategy == "ip":
-        return _partition_ip(tuples, block_sizes, preferences)
-    else:
-        return _partition_random(tuples, block_sizes)
+```
+1. Partition     tuples → unordered groups of k tuples, one per block (strategy below)
+2. Local search  random swaps of tuples between blocks with the same n (keep improvements;
+                 randomized, reproducible through the `seed` option)
+3. Fixed seqs    attach pre-specified sequences as an extra room (optional)
+4. Ordering      order the tuples of every block (enumerate | greedy)
 ```
 
-### Q2: How to handle ordering within blocks?
+With presenter availability constraints, the pipelines call `solve_phase2_with_feasibility_check()`, which wraps these steps in a feasibility check, repair and retry loop (see below).
 
-**Decision:** Start with **enumeration** of all permutations (feasible for k ≤ 4), but encapsulate in a function that can be **replaced by DP or other methods** later.
+### Partition Strategies
 
-**Implementation:**
-```python
-def optimize_block_ordering(
-    tuples: List[Tuple[str, ...]],  # Unordered tuples for one block
-    preferences: Dict[str, Set[str]],
-    strategy: str = "enumerate"  # "enumerate" | "dp" | "greedy"
-) -> Tuple[List[Tuple[str, ...]], int]:
-    """
-    Find optimal ordering of tuples within a block.
-    Returns (ordered_tuples, hopping_cost).
-    """
-    if strategy == "enumerate":
-        return _order_by_enumeration(tuples, preferences)
-    elif strategy == "dp":
-        return _order_by_dp(tuples, preferences)
-    else:
-        return _order_greedy(tuples, preferences)
-```
+**Config key:** `phase2.partition_strategy` | **CLI:** `--phase2-partition` (traditional pipeline; the heuristic pipeline always uses `matching`)
 
-### Q3: Exact vs Heuristic (Overall)
+| Strategy | Method |
+|----------|--------|
+| `greedy` (default) | Fills blocks one at a time. Each next tuple is the one with the fewest participants who also want to attend a tuple already in the block (conflict count). |
+| `random` | Random assignment; a baseline for comparison. |
+| `matching` | The paper's approach, for blocks with $k \in \{2, 4\}$ (see below). Other $k$ (e.g. 3) use a greedy partition with a presenter-availability compatibility check. |
 
-**Clarification:** This was asking the same as Q1 at a higher level. Since n=4 (≥3), the problem is NP-hard per the paper. The decision is:
-- **Heuristic first** (greedy partition + enumeration for ordering)
-- **IP-based partition as optional upgrade** (clean interface allows swapping)
+**Matching-based partition** (`partition_tuples_matching_based`):
 
-### Q4: Interface with Phase 3
+1. Build a complete graph whose nodes are the tuples.
+2. The cost of an edge between two tuples is the optimal value of an assignment problem that aligns their talks room by room. Aligning talk $i$ (first tuple) with talk $j$ (second tuple) costs $d_{ij}$, the number of participants who want $i$ and another talk of the second tuple, or $j$ and another talk of the first tuple.
+3. A minimum-cost perfect matching (networkx) pairs tuples into 2-blocks.
+4. For $k = 4$, the 2-blocks are matched again into 4-blocks.
 
-**Decision:** Yes, include `block_type` in the Block output so Phase 3 can match blocks to compatible timeslots.
+Edges that would create a block with no feasible timeslot for its presenters are excluded. If no perfect matching exists, the greedy partition is used instead.
+
+When several block types share a tuple size (e.g. `5R4T` and `5R3T`), the tuples are split between them in list order before partitioning; block types are then assigned to the resulting blocks so that presenters avoid block types whose timeslots they cannot attend.
+
+### Fixed Sequences
+
+A `FixedSequence` (config `phase2.fixed_sequences`) is a list of $k$ talks that run one after another in one room. Phase 1 schedules one block of `result_block_type` as `target_block_type` (one room fewer); after partitioning, the sequence is attached to such a block as an extra room. The sequence keeps its talk order: with `enumerate` ordering, the block's own tuples are ordered around it to minimize hopping, and the block is not re-ordered afterwards.
+
+### Presenter Availability: Check, Repair, Retry
+
+After partitioning, every block must have at least one timeslot of its type at which all of its presenters are available (`check_block_feasibility`). If some block has none:
+
+1. **Repair** (`repair_block_feasibility`): swap whole tuples between blocks with the same $n$. Each step applies the swap that makes the most infeasible blocks feasible without breaking a feasible one (ties: smallest hopping increase).
+2. **Retry**: if the repair fails, re-partition — greedy with perturbed choices, or matching excluding the previous solution (Gurobi; without Gurobi the edge costs are randomly perturbed) — up to `max_feasibility_retries` (10) times.
+
+Remaining violations are left to Phase 3 (which minimizes them) and swap optimization.
 
 ---
 
-## Architecture: Modular Design
+## Complexity
 
-```
-Phase2Input
-    │
-    ▼
-┌─────────────────────────────────┐
-│  partition_tuples_into_blocks() │  ← Strategy: "greedy" | "ip"
-│  Returns: unordered tuple groups│
-└─────────────────────────────────┘
-    │
-    ▼ (for each group)
-┌─────────────────────────────────┐
-│  optimize_block_ordering()      │  ← Strategy: "enumerate" | "dp"
-│  Returns: ordered tuples + cost │
-└─────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────┐
-│  Build Block objects            │
-│  Include: block_type, tuples,   │
-│           hopping_cost          │
-└─────────────────────────────────┘
-    │
-    ▼
-Phase2Result
-```
+The number of ways to partition tuples into blocks is very large. For example, 20 tuples into 4 blocks of 3 and 2 blocks of 4:
 
----
+- choose 12 tuples for the 3-blocks: $\binom{20}{12}$
+- split those into 4 groups of 3: $\frac{12!}{(3!)^4 \cdot 4!}$
+- split the remaining 8 into 2 groups of 4: $\frac{8!}{(4!)^2 \cdot 2!}$
 
-## Complexity Analysis
-
-### Tuple Enumeration
-- Number of ways to partition 20 tuples into blocks: combinatorially large
-- For 4 blocks of 3 and 2 blocks of 4:
-  - Choose 12 tuples for size-3 blocks: $\binom{20}{12}$
-  - Partition those 12 into 4 groups of 3: $\frac{12!}{(3!)^4 \cdot 4!}$
-  - Partition remaining 8 into 2 groups of 4: $\frac{8!}{(4!)^2 \cdot 2!}$
-  - This is very large → need heuristic or optimization
-
-### Ordering Within Blocks
-- For $k = 3$: 6 permutations per block
-- For $k = 4$: 24 permutations per block
-- With 6 blocks total: manageable
+Hence the heuristic partition strategies. Ordering within a block is cheap: 6 orders for $k = 3$, 24 for $k = 4$.
 
 ---
 
 ## Example
 
+Requires Gurobi (for Phase 1):
+
 ```python
-from src.phase2 import assemble_blocks, Phase2Input
+from collections import defaultdict
 
-# Input from Phase 1
-phase1_result = [
-    ('T001', 'T027', 'T045', 'T069'),
-    ('T002', 'T004', 'T043', 'T065'),
-    # ... 18 more tuples
-]
+from src.data_loader import load_from_csv_dir
+from src.instance import build_instance
+from src.phase1 import solve_phase1
+from src.phase2 import Phase2Input, solve_phase2
 
-# Block sizes needed
-block_sizes = [
-    (3, 4),  # 4 blocks of size 3 (from 4R3T)
-    (4, 2),  # 2 blocks of size 4 (from 4R4T)
-]
+data = load_from_csv_dir("examples/synthetic")
+data.validate()
+instance = build_instance(data)
 
-# Run Phase 2
-phase2_input = Phase2Input(
-    tuples=phase1_result,
-    block_sizes=block_sizes,
-    preferences=instance.preferences
+# Phase 1: tuples of parallel talks, grouped by size n
+tuples_by_n = defaultdict(list)
+for t in solve_phase1(instance, time_limit=60.0, verbose=False):
+    tuples_by_n[len(t)].append(t)
+
+# Phase 2: one block spec per block type: (n, k, count, block_type)
+block_specs = [(bt["n"], bt["k"], bt["count"], type_id)
+               for type_id, bt in instance.block_types.items()]
+phase2_result = solve_phase2(
+    Phase2Input(tuples_by_n=dict(tuples_by_n), block_specs=block_specs,
+                preferences=instance.preferences),
+    partition_strategy="matching",
+    verbose=False,
 )
-
-phase2_result = assemble_blocks(phase2_input)
 
 print(f"Total hopping: {phase2_result.total_hopping}")
 for block in phase2_result.blocks:
@@ -383,4 +179,3 @@ for block in phase2_result.blocks:
 ## References
 
 - Vangerven et al. (2018), Section 5.2: "Phase 2: minimizing session hopping"
-- Equations (4)-(7) in the paper (hopping number definition and DP)

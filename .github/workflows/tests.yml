@@ -1,0 +1,25 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # Runs without Gurobi: Gurobi-dependent tests are skipped, which also
+    # checks that the heuristic pipeline and the evaluator work without it.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest
+      - name: Run the heuristic pipeline on the example data
+        run: python scripts/run_schedule.py --pipeline heuristic --data-dir examples/orbel2026

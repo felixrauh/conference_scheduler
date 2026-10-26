@@ -76,7 +76,7 @@ def load_talk_metadata(
 
     # Primary source: talks_for_algorithm.csv (has talk_id -> keywords directly)
     talkid_to_keywords = {}
-    if Path(algo_file).exists():
+    if algo_file and Path(algo_file).exists():
         algo_df = pd.read_csv(algo_file)
         for _, row in algo_df.iterrows():
             talk_id = f"T{row['talk_id']:03d}"
@@ -90,7 +90,7 @@ def load_talk_metadata(
 
     # Fallback: title-based keywords from talks_with_abstracts file
     title_to_keywords = {}
-    if Path(talks_file).exists():
+    if talks_file and Path(talks_file).exists():
         keywords_df = pd.read_csv(talks_file)
         for _, row in keywords_df.iterrows():
             title = str(row['title']).strip()
@@ -102,7 +102,7 @@ def load_talk_metadata(
     # Load pre-pairings for special groups
     special_groups = {}  # talk_number -> group_name
 
-    if Path(pre_pairings_file).exists():
+    if pre_pairings_file and Path(pre_pairings_file).exists():
         pairings_df = pd.read_excel(pre_pairings_file, engine='openpyxl')
 
         for _, row in pairings_df.iterrows():
@@ -388,7 +388,8 @@ def solve_phase_a_constrained(
     if model.Status == GRB.INFEASIBLE:
         raise ValueError(
             f"Phase A infeasible - need {M} pairs but constraints too restrictive. "
-            f"Try relaxing require_common_keyword or check special group assignments."
+            f"Try the soft keyword constraint (--max-violations 0), drop "
+            f"--require-keyword, or check special group assignments."
         )
 
     if model.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT]:

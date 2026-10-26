@@ -40,6 +40,7 @@ import copy
 
 from .phase2 import Block
 from .phase3 import Phase3Result, RoomAssignment
+from .utils import is_placeholder
 
 
 # =============================================================================
@@ -176,7 +177,7 @@ def detect_dummy_violations(
 
         for tuple_idx, ntuple in enumerate(block.tuples):
             for room_idx, talk_id in enumerate(ntuple):
-                if talk_id.startswith('DUMMY'):
+                if is_placeholder(talk_id):
                     dummies_by_room[room_idx].append((tuple_idx, talk_id))
 
         # Check for violations
@@ -549,7 +550,7 @@ def generate_swap_candidates(
                     continue
 
                 # Skip dummy talks
-                if tgt_talk_id.startswith('DUMMY'):
+                if is_placeholder(tgt_talk_id):
                     continue
 
                 # Get source timeslot
@@ -626,8 +627,8 @@ def check_swap_creates_dummy_violation(
 
     Returns True if swap creates a dummy violation.
     """
-    src_is_dummy = src_talk_id.startswith('DUMMY')
-    tgt_is_dummy = tgt_talk_id.startswith('DUMMY')
+    src_is_dummy = is_placeholder(src_talk_id)
+    tgt_is_dummy = is_placeholder(tgt_talk_id)
 
     src_assignment = phase3_result.assignments[src_block_idx]
     tgt_assignment = phase3_result.assignments[tgt_block_idx]
@@ -644,7 +645,7 @@ def check_swap_creates_dummy_violation(
         # Check if target room-session already has a dummy
         tgt_room_talks = [t[tgt_room_idx] for t in tgt_assignment.block.tuples]
         existing_dummies = sum(
-            1 for t in tgt_room_talks if t.startswith('DUMMY'))
+            1 for t in tgt_room_talks if is_placeholder(t))
         if existing_dummies > 0:
             return True
 
@@ -713,7 +714,7 @@ def generate_dummy_swap_candidates(
                     continue
 
                 # Skip other dummy talks (we want to swap with non-dummies)
-                if tgt_talk_id.startswith('DUMMY'):
+                if is_placeholder(tgt_talk_id):
                     continue
 
                 # Check if moving the target talk to the short block creates presenter violation
@@ -738,7 +739,7 @@ def generate_dummy_swap_candidates(
                 # Check if target room-session would have multiple dummies after swap
                 tgt_room_talks = [t[tgt_room_idx] for t in block.tuples]
                 existing_dummies_in_target = sum(
-                    1 for t in tgt_room_talks if t.startswith('DUMMY'))
+                    1 for t in tgt_room_talks if is_placeholder(t))
                 if existing_dummies_in_target > 0:
                     continue  # Would create multiple dummies in same room-session
 
@@ -978,8 +979,8 @@ def optimize_presenter_violations(
         swaps_applied.append(best_swap)
 
         if verbose:
-            swap_type = "DUMMY" if best_swap.src_talk_id.startswith(
-                'DUMMY') else "PRES"
+            swap_type = "DUMMY" if is_placeholder(
+                best_swap.src_talk_id) else "PRES"
             print(f"  Swap {iteration + 1} [{swap_type}]: {best_swap.src_talk_id} <-> {best_swap.tgt_talk_id} "
                   f"(Δmissed={best_swap.missed_attendance_delta:+d}, "
                   f"Δkeyword={best_swap.keyword_delta:+.2f})")
